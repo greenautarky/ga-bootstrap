@@ -85,7 +85,13 @@ if queue:
 else:
     # Default per verb — must satisfy the script's grep / exit-check.
     if key == 'supervisor info':
-        stdout, stderr, code = '{{"result":"ok"}}', '', 0
+        # Provide BOTH the result=ok signal AND the data.auto_update field
+        # since step 1a (auto_update=false) also parses this response.
+        stdout, stderr, code = '{{"result":"ok","data":{{"auto_update":false}}}}', '', 0
+    elif key == 'supervisor options':
+        stdout, stderr, code = '', '', 0
+    elif key == 'core info':
+        stdout, stderr, code = '{{"result":"ok","data":{{"state":"running"}}}}', '', 0
     elif key == 'store add':
         stdout, stderr, code = 'Store added', '', 0
     elif key == 'addons install':
@@ -128,6 +134,8 @@ def bootstrap_env(tmp_path: Path) -> dict[str, str]:
         "MARKER": str(marker),
         "SUPERVISOR_WAIT_S": "5",
         "SUPERVISOR_POLL_INTERVAL": "1",
+        "HA_CORE_WAIT_S": "5",
+        "HA_CORE_POLL_INTERVAL": "1",
         "GA_MANAGER_SLUG": "99f1cad4_ga_manager",
         "VIBE_STORE_URL": "https://example.invalid/vibe_addons",
         "GHCR_CREDS_FILE": str(creds),

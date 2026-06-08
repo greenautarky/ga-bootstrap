@@ -32,10 +32,27 @@
 #   VIBE_STORE_URL            default https://github.com/greenautarky/vibe_addons
 #   GHCR_CREDS_FILE           default /etc/ga/ghcr-creds.json
 #                              {"ghcr.io":{"username":"…","password":"…"}}
+#   HA_CORE_WAIT_S            default 600   (HA Core cold-start can be slow)
+#   HA_CORE_POLL_INTERVAL     default 10
+#   JQ_CLI                    default jq    (path / fallback for the json parser)
 #
 # Test seam: every external binary is invoked via a variable so the
 # pytest harness can replace `ha` / `docker` with a shim on $PATH and
 # `BG_DRY_RUN=1` short-circuits the marker write.
+#
+# Step 0a (auto_update=false) goes via the Supervisor API, not direct
+# edit of updater.json — the OS-side ga-ha-init learned the hard way
+# (KIB-SON-31 first boot 2026-05-27) that Supervisor rewrites
+# updater.json on the next refresh, clobbering any jq-style direct edit.
+# `ha supervisor options --auto-update=false` mutates Supervisor's
+# in-memory state and persists. Order matters: run Step 0a *before*
+# installing addons so even the first ga_manager addon install can't
+# trigger an auto-update side effect.
+#
+# Step 6 (wait for HA Core ready) absorbs ga-ha-init's responsibilities
+# so ga-bootstrap exits only once the device is fully reachable. The
+# OS-side ga-ha-init.service is removed in the matching ha-operating-
+# system PR.
 
 set -eu
 
@@ -49,10 +66,13 @@ fi
 MARKER="${MARKER:-/mnt/data/.ga-bootstrapped}"
 SUPERVISOR_WAIT_S="${SUPERVISOR_WAIT_S:-1200}"
 SUPERVISOR_POLL_INTERVAL="${SUPERVISOR_POLL_INTERVAL:-5}"
+HA_CORE_WAIT_S="${HA_CORE_WAIT_S:-600}"
+HA_CORE_POLL_INTERVAL="${HA_CORE_POLL_INTERVAL:-10}"
 GA_MANAGER_SLUG="${GA_MANAGER_SLUG:-99f1cad4_ga_manager}"
 VIBE_STORE_URL="${VIBE_STORE_URL:-https://github.com/greenautarky/vibe_addons}"
 GHCR_CREDS_FILE="${GHCR_CREDS_FILE:-/etc/ga/ghcr-creds.json}"
 HA_CLI="${HA_CLI:-ha}"
+JQ_CLI="${JQ_CLI:-jq}"
 DRY_RUN="${BG_DRY_RUN:-0}"
 
 log() { printf '[ga-bootstrap] %s\n' "$*"; }
@@ -67,8 +87,10 @@ fi
 # --- 1. wait for supervisor -------------------------------------------
 log "waiting for Supervisor (up to ${SUPERVISOR_WAIT_S}s)"
 deadline=$(( $(date +%s) + SUPERVISOR_WAIT_S ))
+sup_info=""
 while :; do
-  if "$HA_CLI" supervisor info --raw-json 2>/dev/null | grep -q '"result":"ok"'; then
+  sup_info=$("$HA_CLI" supervisor info --raw-json 2>/dev/null || true)
+  if printf '%s' "$sup_info" | grep -q '"result":"ok"'; then
     log "Supervisor ready"
     break
   fi
@@ -77,6 +99,40 @@ while :; do
   fi
   sleep "$SUPERVISOR_POLL_INTERVAL"
 done
+
+# --- 1a. disable Supervisor auto-update -------------------------------
+# Why: fleet devices must not auto-update Supervisor — the rollout is
+# operator-controlled via push-ota.sh + RAUC bundle promotion. Auto-update
+# bypasses that and has caused incidents (incident_ga1_hang_2026_05_06 —
+# Supervisor auto-updated hassio_cli mid-run and triggered an eMMC stall).
+#
+# Go via the Supervisor API even though we have jq — direct jq on
+# /mnt/data/supervisor/updater.json silently fails: Supervisor caches
+# auto_update in memory and rewrites the file on the next refresh,
+# clobbering the edit (observed on KIB-SON-31, 2026-05-27). The CLI's
+# `supervisor options --auto-update=false` mutates the in-memory state
+# so the change actually sticks.
+# Reuse the supervisor-info response we just captured in the wait loop
+# above — one fewer API round-trip. NB: do NOT use jq's `// "missing"`
+# here — `//` triggers on null OR false, so a correct
+# `auto_update: false` reading would report "missing" and we'd re-issue
+# the options call every boot. Read the raw bool with tostring instead;
+# a genuinely missing field shows up as "null" and we treat that as
+# "needs setting".
+current_auto=$(printf '%s' "$sup_info" \
+                  | "$JQ_CLI" -r '.data.auto_update | tostring' 2>/dev/null || echo null)
+if [ "$current_auto" = "false" ]; then
+  log "Supervisor auto_update=false (already set)"
+else
+  log "Supervisor auto_update was $current_auto — setting false via API"
+  if ! "$HA_CLI" supervisor options --auto-update=false --no-progress >/dev/null 2>&1; then
+    # NON-FATAL: if Supervisor's API rejects the call here, the device
+    # is still usable and ga_manager converge step 8 will retry every
+    # 30 s. We log a warning, do NOT bail — exiting non-zero here
+    # would prevent the rest of bootstrap from running.
+    log "WARN: Supervisor rejected auto-update=false — converge will retry"
+  fi
+fi
 
 # --- 2. add vibe_addons store -----------------------------------------
 # `store add` is idempotent server-side — re-adding the same URL is a no-op.
@@ -124,6 +180,29 @@ log "starting $GA_MANAGER_SLUG"
 if ! "$HA_CLI" addons start "$GA_MANAGER_SLUG"; then
   fail "ga_manager start failed (slug=$GA_MANAGER_SLUG)" 4
 fi
+
+# --- 4a. wait for HA Core ready ---------------------------------------
+# Absorbs ga-ha-init's wait. We want ga-bootstrap to exit only once
+# the device is fully reachable end-to-end — that's the contract a
+# fleet-manager status probe relies on. Best-effort: if Core never
+# reports "running" within HA_CORE_WAIT_S we log + continue (do NOT
+# fail). The marker still gets written so a later boot isn't blocked
+# on this same wait — converge keeps an eye on Core health after that.
+log "waiting for HA Core to report state=running (up to ${HA_CORE_WAIT_S}s)"
+deadline=$(( $(date +%s) + HA_CORE_WAIT_S ))
+while :; do
+  state=$("$HA_CLI" core info --no-progress --raw-json 2>/dev/null \
+            | "$JQ_CLI" -r '.data.state // ""' 2>/dev/null || true)
+  if [ "$state" = "running" ]; then
+    log "HA Core state=running"
+    break
+  fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    log "WARN: HA Core never reported running within ${HA_CORE_WAIT_S}s (last state=${state:-unknown}) — continuing"
+    break
+  fi
+  sleep "$HA_CORE_POLL_INTERVAL"
+done
 
 # --- 5. touch marker --------------------------------------------------
 if [ "$DRY_RUN" = "1" ]; then

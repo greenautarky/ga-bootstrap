@@ -21,14 +21,15 @@ def test_happy_path_writes_marker_and_calls_expected_commands(run_bootstrap, boo
     assert result.returncode == 0, result.stderr
     assert Path(bootstrap_env["MARKER"]).is_file()
 
-    # The 4 documented bootstrap calls must all have happened, in order.
+    # The 6 documented bootstrap calls must all have happened, in order.
     flat = [" ".join(c) for c in result.ha_calls]
     sup_idx = next(i for i, s in enumerate(flat) if "supervisor info" in s)
     store_idx = next(i for i, s in enumerate(flat) if "store add" in s)
     registry_idx = next(i for i, s in enumerate(flat) if "docker registries" in s)
     install_idx = next(i for i, s in enumerate(flat) if "addons install" in s)
     start_idx = next(i for i, s in enumerate(flat) if "addons start" in s)
-    assert sup_idx < store_idx < registry_idx < install_idx < start_idx
+    core_idx = next(i for i, s in enumerate(flat) if "core info" in s)
+    assert sup_idx < store_idx < registry_idx < install_idx < start_idx < core_idx
 
 
 def test_marker_present_short_circuits_with_zero_calls(run_bootstrap, bootstrap_env):
@@ -121,3 +122,93 @@ def test_custom_slug_via_env(run_bootstrap):
     assert result.returncode == 0
     install_call = next(c for c in result.ha_calls if "install" in c and "addons" in c)
     assert "testslug_ga_manager" in install_call
+
+
+# --- Step 0a: auto_update=false ---------------------------------------
+
+
+def test_auto_update_already_false_skips_options_call(run_bootstrap, fake_ha):
+    """If `supervisor info` already reports auto_update=false, we MUST
+    NOT call `supervisor options` again. Cheap idempotency check."""
+    # Replace the default "supervisor info" response so it cleanly reports
+    # auto_update already false. The default already does this — make it
+    # explicit for the test.
+    fake_ha.enqueue(
+        "supervisor info",
+        stdout='{"result":"ok","data":{"auto_update":false}}',
+        code=0,
+    )
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stderr
+    options_calls = [c for c in result.ha_calls if "supervisor" in c and "options" in c]
+    assert options_calls == [], f"unexpected options call: {options_calls}"
+
+
+def test_auto_update_true_triggers_options_false_call(run_bootstrap, fake_ha):
+    """If Supervisor reports auto_update=true, we MUST call
+    `supervisor options --auto-update=false` to flip it."""
+    fake_ha.enqueue(
+        "supervisor info",
+        stdout='{"result":"ok","data":{"auto_update":true}}',
+        code=0,
+    )
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stderr
+    options_calls = [c for c in result.ha_calls if "supervisor" in c and "options" in c]
+    assert len(options_calls) == 1
+    assert "--auto-update=false" in options_calls[0]
+
+
+def test_auto_update_options_failure_is_non_fatal(run_bootstrap, fake_ha, bootstrap_env):
+    """If Supervisor rejects the options call, bootstrap MUST continue
+    (ga_manager converge will retry). Marker must still be written."""
+    fake_ha.enqueue(
+        "supervisor info",
+        stdout='{"result":"ok","data":{"auto_update":true}}',
+        code=0,
+    )
+    fake_ha.enqueue("supervisor options", code=1, stderr="500 internal")
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stderr
+    assert Path(bootstrap_env["MARKER"]).is_file()
+    assert "WARN" in (result.stdout + result.stderr)
+
+
+# --- Step 6: wait for HA Core ready -----------------------------------
+
+
+def test_core_ready_immediately_writes_marker(run_bootstrap, bootstrap_env):
+    """Default core info returns state=running on the first poll — marker written."""
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stderr
+    assert Path(bootstrap_env["MARKER"]).is_file()
+    core_calls = [c for c in result.ha_calls if "core" in c and "info" in c]
+    # At least one core info call; in the happy path exactly one (returns running first try).
+    assert len(core_calls) >= 1
+
+
+def test_core_never_ready_still_writes_marker_with_warning(
+    run_bootstrap, fake_ha, bootstrap_env
+):
+    """Step 6 is best-effort — if Core never reports running we log a
+    WARN and continue. Marker MUST still be written so future boots
+    aren't blocked on the same wait."""
+    # Queue 10 non-running responses so the deadline (5 s @ 1 s poll) hits first.
+    for _ in range(10):
+        fake_ha.enqueue("core info", stdout='{"result":"ok","data":{"state":"starting"}}', code=0)
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stderr
+    assert Path(bootstrap_env["MARKER"]).is_file()
+    assert "HA Core never reported running" in (result.stdout + result.stderr)
+
+
+def test_core_eventually_ready_succeeds(run_bootstrap, fake_ha, bootstrap_env):
+    """3 polls returning 'starting' then one returning 'running' — marker written."""
+    fake_ha.enqueue("core info", stdout='{"result":"ok","data":{"state":"starting"}}', code=0)
+    fake_ha.enqueue("core info", stdout='{"result":"ok","data":{"state":"starting"}}', code=0)
+    fake_ha.enqueue("core info", stdout='{"result":"ok","data":{"state":"running"}}', code=0)
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stderr
+    assert Path(bootstrap_env["MARKER"]).is_file()
+    core_calls = [c for c in result.ha_calls if "core" in c and "info" in c]
+    assert len(core_calls) >= 3
