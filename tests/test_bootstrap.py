@@ -45,7 +45,9 @@ def test_supervisor_never_ready_exits_1(run_bootstrap, fake_ha):
     for _ in range(10):
         fake_ha.enqueue("supervisor info", stdout="", code=0)
     result = run_bootstrap()
-    assert result.returncode == 1, f"expected exit 1, got {result.returncode}; stderr={result.stderr}"
+    assert result.returncode == 1, (
+        f"expected exit 1, got {result.returncode}; stderr={result.stderr}"
+    )
     assert "Supervisor never reported ok" in result.stdout + result.stderr
 
 

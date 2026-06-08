@@ -45,7 +45,14 @@ class FakeHA:
     responses: dict[str, list[tuple[str, str, int]]] = field(default_factory=dict)
     invocations: list[list[str]] = field(default_factory=list)
 
-    def enqueue(self, verb_prefix: str, *, stdout: str = "", stderr: str = "", code: int = 0) -> None:
+    def enqueue(
+        self,
+        verb_prefix: str,
+        *,
+        stdout: str = "",
+        stderr: str = "",
+        code: int = 0,
+    ) -> None:
         self.responses.setdefault(verb_prefix, []).append((stdout, stderr, code))
 
 
