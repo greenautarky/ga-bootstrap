@@ -1,0 +1,23 @@
+[Unit]
+Description=greenautarky first-boot bootstrap (install ga_manager → converge takes over)
+Documentation=https://github.com/greenautarky/ga-bootstrap
+After=hassio-supervisor.service network-online.target
+Wants=network-online.target
+Requires=hassio-supervisor.service
+ConditionPathExists=!/mnt/data/.ga-bootstrapped
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=1500
+ExecStart=/usr/sbin/ga-bootstrap
+StandardOutput=journal+console
+StandardError=journal+console
+
+# Service is the entry-point of the whole user-facing stack — if it
+# panics we want the boot to continue so an operator can SSH in and
+# fix things rather than getting an unreachable device.
+SuccessExitStatus=0
+
+[Install]
+WantedBy=multi-user.target

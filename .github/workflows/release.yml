@@ -1,0 +1,84 @@
+name: Release
+
+# Publishes a self-contained OCI artifact at
+# ghcr.io/greenautarky/ga-bootstrap:<tag> that the ha-operating-system
+# buildroot package pulls at OS build time. Same pattern as
+# greenautarky/greenautarky-onboarding and greenautarky/ga-frontend-bundle.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (default: tag-derived)"
+        required: false
+
+permissions:
+  contents: write   # create the GitHub Release
+  packages: write   # push the OCI artifact to GHCR
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version + assert pyproject matches
+        id: ver
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            REQ="${GITHUB_REF_NAME#v}"
+          else
+            REQ="${{ github.event.inputs.version }}"
+            [ -z "$REQ" ] && REQ=$(grep '^version' pyproject.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          fi
+          PY=$(grep '^version' pyproject.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$REQ" != "$PY" ]; then
+            echo "::error::Version drift — tag=$REQ pyproject=$PY"
+            exit 1
+          fi
+          echo "version=$REQ" >> "$GITHUB_OUTPUT"
+          echo "Publishing v$REQ"
+
+      - name: Sanity-check the bootstrap script is executable
+        run: |
+          test -x src/ga-bootstrap/usr/sbin/ga-bootstrap
+
+      - name: Package the placement artifact
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          # Tarball root contains `usr/` and `etc/` so a consumer extracts
+          # straight into a rootfs (or rootfs-overlay): `tar xzf - -C /` /
+          # `tar xzf - -C buildroot-external/rootfs-overlay/`.
+          tar czf "ga-bootstrap-${V}.tar.gz" \
+            -C src/ga-bootstrap usr etc
+          sha256sum "ga-bootstrap-${V}.tar.gz" > SHA256SUMS
+          echo "--- SHA256SUMS ---"; cat SHA256SUMS
+
+      - name: Install oras
+        uses: oras-project/setup-oras@v1
+
+      - name: Push OCI artifact to GHCR
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          REPO="ghcr.io/greenautarky/ga-bootstrap"
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          oras push "${REPO}:${V}" \
+            --annotation "org.opencontainers.image.source=https://github.com/greenautarky/ga-bootstrap" \
+            --annotation "org.opencontainers.image.version=${V}" \
+            "ga-bootstrap-${V}.tar.gz:application/gzip" \
+            "SHA256SUMS:text/plain"
+          oras tag "${REPO}:${V}" latest
+
+      - name: Create / update the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          NOTES="ga-bootstrap v${V} — see CHANGELOG.md for details. Placement artifact: ga-bootstrap-${V}.tar.gz — extract into rootfs (\`tar xzf - -C /\`). Also at ghcr.io/greenautarky/ga-bootstrap:${V}."
+          gh release create "v${V}" --title "v${V}" --notes "$NOTES" \
+            "ga-bootstrap-${V}.tar.gz" "SHA256SUMS" \
+          || gh release upload "v${V}" \
+            "ga-bootstrap-${V}.tar.gz" "SHA256SUMS" --clobber

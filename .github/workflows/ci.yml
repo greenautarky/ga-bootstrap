@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - run: pip install ruff
+      - name: Ruff (tests only — shell script is shellcheck's job)
+        run: ruff check tests/
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint the bootstrap script
+        run: shellcheck -s sh src/ga-bootstrap/usr/sbin/ga-bootstrap
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Install
+        run: pip install -e .[dev]
+      - name: Pytest
+        run: pytest tests/ -v
+
+  systemd-unit-check:
+    # Sanity: the .service file is consumed by systemd at boot, so a
+    # parse error means a brick. systemd-analyze verify is cheap and
+    # catches typos before they reach a device.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install systemd
+        run: sudo apt-get update && sudo apt-get install -y systemd
+      - name: Verify unit syntax
+        run: |
+          # `verify` cares about ordering deps (After=…) referencing real
+          # units that don't exist on the runner — that's normal, suppress
+          # those warnings and only fail on real parse errors.
+          systemd-analyze verify src/ga-bootstrap/etc/systemd/system/ga-bootstrap.service 2>&1 \
+            | tee /tmp/verify.log \
+            | grep -Ev 'not found|hassio-supervisor.service|Cannot add dependency' \
+            || true
+          # The exit-code matters even when the line filter swallowed warnings.
+          if grep -qE '^.*(syntax error|Failed to parse)' /tmp/verify.log; then
+            echo "::error::systemd unit failed to parse"; exit 1
+          fi

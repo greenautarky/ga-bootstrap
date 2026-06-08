@@ -1,0 +1,30 @@
+[project]
+name = "ga-bootstrap"
+version = "1.0.0"
+description = "First-boot orchestrator for GreenAutarky devices — installs ga_manager addon and hands off to converge"
+authors = [{name = "Thomas Taube", email = "thomas@greenautarky.com"}]
+license = {text = "Proprietary"}
+requires-python = ">=3.13"
+
+# The actual payload is plain POSIX shell — Python is only here so we
+# can reuse pyproject's ruff + pytest config and the same tag-driven
+# release pipeline as greenautarky-onboarding.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"

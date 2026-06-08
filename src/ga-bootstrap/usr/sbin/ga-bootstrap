@@ -1,0 +1,136 @@
+#!/bin/sh
+# ga-bootstrap — first-boot orchestrator that brings up ga_manager.
+#
+# Runs once after `hassio-supervisor.service` is healthy. Performs the
+# minimum bootstrap steps needed for ga_manager to take over and converge
+# the rest of the system:
+#
+#   1. Wait until Supervisor responds.
+#   2. Add the public `vibe_addons` add-on store (idempotent).
+#   3. Write GHCR pull credentials into Supervisor's auth registry
+#      (= unblocks pulling the private ga_manager addon image).
+#   4. Install + start the `ga_manager` add-on.
+#   5. Touch the marker file so this service is a no-op on future boots.
+#
+# Everything beyond this — DNS, watchdog, addon options, per-device
+# secrets, bundle expectation, dashboard, etc. — is the responsibility
+# of `ga_manager` converge. Keep ga-bootstrap tiny.
+#
+# Exit codes:
+#   0 — bootstrap finished cleanly OR marker already present (no-op).
+#   1 — Supervisor never came up within SUPERVISOR_WAIT_S seconds.
+#   2 — Adding the vibe_addons store failed (network / supervisor error).
+#   3 — Writing GHCR credentials failed.
+#   4 — `ha addons install ga_manager` failed.
+#
+# Env overrides (read from /etc/ga/ga-bootstrap.conf if present, then
+# from the environment — env wins):
+#   MARKER                    default /mnt/data/.ga-bootstrapped
+#   SUPERVISOR_WAIT_S         default 1200  (cold boot eMMC is slow)
+#   SUPERVISOR_POLL_INTERVAL  default 5
+#   GA_MANAGER_SLUG           default 99f1cad4_ga_manager
+#   VIBE_STORE_URL            default https://github.com/greenautarky/vibe_addons
+#   GHCR_CREDS_FILE           default /etc/ga/ghcr-creds.json
+#                              {"ghcr.io":{"username":"…","password":"…"}}
+#
+# Test seam: every external binary is invoked via a variable so the
+# pytest harness can replace `ha` / `docker` with a shim on $PATH and
+# `BG_DRY_RUN=1` short-circuits the marker write.
+
+set -eu
+
+# --- config -----------------------------------------------------------
+CONF=/etc/ga/ga-bootstrap.conf
+if [ -f "$CONF" ]; then
+  # shellcheck disable=SC1090  # runtime-resolved path is intentional
+  . "$CONF"
+fi
+
+MARKER="${MARKER:-/mnt/data/.ga-bootstrapped}"
+SUPERVISOR_WAIT_S="${SUPERVISOR_WAIT_S:-1200}"
+SUPERVISOR_POLL_INTERVAL="${SUPERVISOR_POLL_INTERVAL:-5}"
+GA_MANAGER_SLUG="${GA_MANAGER_SLUG:-99f1cad4_ga_manager}"
+VIBE_STORE_URL="${VIBE_STORE_URL:-https://github.com/greenautarky/vibe_addons}"
+GHCR_CREDS_FILE="${GHCR_CREDS_FILE:-/etc/ga/ghcr-creds.json}"
+HA_CLI="${HA_CLI:-ha}"
+DRY_RUN="${BG_DRY_RUN:-0}"
+
+log() { printf '[ga-bootstrap] %s\n' "$*"; }
+fail() { log "ERROR: $1"; exit "${2:-1}"; }
+
+# --- 0. marker check (idempotent) -------------------------------------
+if [ -f "$MARKER" ]; then
+  log "marker $MARKER present — bootstrap already completed, exiting 0"
+  exit 0
+fi
+
+# --- 1. wait for supervisor -------------------------------------------
+log "waiting for Supervisor (up to ${SUPERVISOR_WAIT_S}s)"
+deadline=$(( $(date +%s) + SUPERVISOR_WAIT_S ))
+while :; do
+  if "$HA_CLI" supervisor info --raw-json 2>/dev/null | grep -q '"result":"ok"'; then
+    log "Supervisor ready"
+    break
+  fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    fail "Supervisor never reported ok within ${SUPERVISOR_WAIT_S}s" 1
+  fi
+  sleep "$SUPERVISOR_POLL_INTERVAL"
+done
+
+# --- 2. add vibe_addons store -----------------------------------------
+# `store add` is idempotent server-side — re-adding the same URL is a no-op.
+log "adding vibe_addons store ($VIBE_STORE_URL)"
+store_log=$(mktemp -t ga-bootstrap-store.XXXXXX)
+# Don't pipe — `tee`'s exit code would mask the `ha` exit code (we'd
+# rather not depend on `set -o pipefail` here since this is /bin/sh).
+"$HA_CLI" --no-progress store add "$VIBE_STORE_URL" >"$store_log" 2>&1 && rc=0 || rc=$?
+cat "$store_log"
+if [ "$rc" -ne 0 ]; then
+  # Supervisor returns non-zero when the store is already known — treat
+  # that as success, fail only on real errors. The log message is stable
+  # enough across Supervisor versions to grep for.
+  if ! grep -q -i 'already' "$store_log"; then
+    rm -f "$store_log"
+    fail "vibe_addons store add failed (exit $rc)" 2
+  fi
+  log "vibe_addons store already present — ok"
+fi
+rm -f "$store_log"
+
+# --- 3. write GHCR pull creds -----------------------------------------
+# Without these, the private ga_manager addon image pull would 401.
+# The PAT is delivered into /etc/ga/ghcr-creds.json at OS bake time;
+# we POST it into Supervisor's registries API so subsequent pulls
+# carry the auth header.
+if [ ! -f "$GHCR_CREDS_FILE" ]; then
+  fail "$GHCR_CREDS_FILE missing — provisioner did not deliver creds" 3
+fi
+log "registering GHCR credentials with Supervisor"
+if ! "$HA_CLI" --raw-json --no-progress \
+      docker registries -f "$GHCR_CREDS_FILE" >/dev/null 2>&1; then
+  fail "Supervisor rejected GHCR creds" 3
+fi
+
+# --- 4. install + start ga_manager ------------------------------------
+# `install` is idempotent — if already installed, Supervisor returns
+# the "already installed" response which `ha` treats as exit 0 on
+# recent versions. We follow with `start` which is also idempotent.
+log "installing $GA_MANAGER_SLUG"
+if ! "$HA_CLI" addons install "$GA_MANAGER_SLUG"; then
+  fail "ga_manager install failed (slug=$GA_MANAGER_SLUG)" 4
+fi
+log "starting $GA_MANAGER_SLUG"
+if ! "$HA_CLI" addons start "$GA_MANAGER_SLUG"; then
+  fail "ga_manager start failed (slug=$GA_MANAGER_SLUG)" 4
+fi
+
+# --- 5. touch marker --------------------------------------------------
+if [ "$DRY_RUN" = "1" ]; then
+  log "dry-run: skipping marker write"
+  exit 0
+fi
+mkdir -p "$(dirname "$MARKER")"
+: > "$MARKER"
+chmod 0644 "$MARKER"
+log "wrote marker $MARKER — bootstrap done"
