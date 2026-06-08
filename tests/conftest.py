@@ -94,10 +94,30 @@ else:
         stdout, stderr, code = '{{"result":"ok","data":{{"state":"running"}}}}', '', 0
     elif key == 'store add':
         stdout, stderr, code = 'Store added', '', 0
+    elif key == 'store reload':
+        stdout, stderr, code = '', '', 0
+    elif key == 'store repositories':
+        # The v1.2.0 script verifies addon_repo_present after store add.
+        # Default: report the test's VIBE_STORE_URL as present (= happy
+        # path). Tests that want to simulate Supervisor's clone race
+        # queue a different response.
+        import os as _o
+        _url = _o.environ.get('VIBE_STORE_URL', 'https://example.invalid/vibe_addons')
+        stdout, stderr, code = (
+            '{{"result":"ok","data":{{"repositories":[{{"source":"' + _url + '"}}]}}}}',
+            '', 0,
+        )
     elif key == 'addons install':
         stdout, stderr, code = 'Installed', '', 0
     elif key == 'addons start':
         stdout, stderr, code = 'Started', '', 0
+    elif key == 'addons info':
+        # The v1.2.0 script verifies addons_installed by checking that
+        # version is a non-null string. Default: report installed.
+        stdout, stderr, code = (
+            '{{"result":"ok","data":{{"version":"0.27.0"}}}}',
+            '', 0,
+        )
     elif key == 'docker registries':
         stdout, stderr, code = '', '', 0
     else:
@@ -140,6 +160,9 @@ def bootstrap_env(tmp_path: Path) -> dict[str, str]:
         "VIBE_STORE_URL": "https://example.invalid/vibe_addons",
         "GHCR_CREDS_FILE": str(creds),
         "BG_DRY_RUN": "0",
+        # Short backoff so the retry tests finish in seconds (production
+        # is 0 10 30 60 120 240 = ~8 min budget).
+        "BACKOFF_SEQUENCE": "0 0 0 0 0 0",
     }
 
 

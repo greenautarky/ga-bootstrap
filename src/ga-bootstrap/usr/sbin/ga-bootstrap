@@ -74,6 +74,11 @@ GHCR_CREDS_FILE="${GHCR_CREDS_FILE:-/etc/ga/ghcr-creds.json}"
 HA_CLI="${HA_CLI:-ha}"
 JQ_CLI="${JQ_CLI:-jq}"
 DRY_RUN="${BG_DRY_RUN:-0}"
+# Exponential-backoff sequence for the two retry loops (store-add +
+# addons-install). Space-separated pre-sleep seconds. Tests override
+# this to short delays so the suite finishes in <30 s; production
+# default is the field-validated 0/10/30/60/120/240 (~8 min budget).
+BACKOFF_SEQUENCE="${BACKOFF_SEQUENCE:-0 10 30 60 120 240}"
 
 log() { printf '[ga-bootstrap] %s\n' "$*"; }
 fail() { log "ERROR: $1"; exit "${2:-1}"; }
@@ -135,24 +140,59 @@ else
 fi
 
 # --- 2. add vibe_addons store -----------------------------------------
-# `store add` is idempotent server-side — re-adding the same URL is a no-op.
-log "adding vibe_addons store ($VIBE_STORE_URL)"
-store_log=$(mktemp -t ga-bootstrap-store.XXXXXX)
-# Don't pipe — `tee`'s exit code would mask the `ha` exit code (we'd
-# rather not depend on `set -o pipefail` here since this is /bin/sh).
-"$HA_CLI" --no-progress store add "$VIBE_STORE_URL" >"$store_log" 2>&1 && rc=0 || rc=$?
-cat "$store_log"
-if [ "$rc" -ne 0 ]; then
-  # Supervisor returns non-zero when the store is already known — treat
-  # that as success, fail only on real errors. The log message is stable
-  # enough across Supervisor versions to grep for.
-  if ! grep -q -i 'already' "$store_log"; then
-    rm -f "$store_log"
-    fail "vibe_addons store add failed (exit $rc)" 2
+# `ha store add` is a misleading API: it returns 0 once Supervisor accepts
+# the addition into its config, but the actual `git clone` happens
+# asynchronously in the background, and can fail with "invalid HEAD" or
+# exit 128 within the first 1-2 minutes (Supervisor + git race on slow
+# eMMC / cold network). A 0 exit code is NOT trust-worthy on its own.
+#
+# We therefore loop with an exponential-backoff (0/10/30/60/120/240 s
+# pre-sleep, ~8 min total budget) AND verify after each call that the
+# repo actually shows up in `ha store repositories --raw-json`.
+#
+# This pattern is identical to the rootfs ga-bootstrap retained until
+# BOSv1.2.4 — proven against transient supervisor-git-clone races in the
+# field. The build-test BS-RETRY-01/02 enforces both exist.
+
+addon_repo_present() {
+  # ha store repositories --raw-json lists configured repos under .data.
+  # Compare source URLs with trailing-slash normalisation.
+  "$HA_CLI" store repositories --no-progress --raw-json 2>/dev/null \
+    | "$JQ_CLI" -e --arg url "$VIBE_STORE_URL" '
+        (.data.repositories // .repositories // .data // [])
+        | map((.source // "") | rtrimstr("/"))
+        | any(. == ($url | rtrimstr("/")))
+      ' >/dev/null 2>&1
+}
+
+log "adding vibe_addons store ($VIBE_STORE_URL) — with retry"
+store_added=0
+for pre_sleep in $BACKOFF_SEQUENCE; do
+  if [ "$pre_sleep" -gt 0 ]; then
+    log "waiting ${pre_sleep}s before retry..."
+    "$HA_CLI" store reload --no-progress >/dev/null 2>&1 || true
+    sleep "$pre_sleep"
   fi
-  log "vibe_addons store already present — ok"
-fi
-rm -f "$store_log"
+  # Capture stderr+stdout so we can distinguish "already added" from
+  # real failures. Exit code alone is insufficient — supervisor returns
+  # non-zero for both "already added" and transient clone failure.
+  store_log=$(mktemp -t ga-bootstrap-store.XXXXXX)
+  "$HA_CLI" --no-progress store add "$VIBE_STORE_URL" >"$store_log" 2>&1 && rc=0 || rc=$?
+  cat "$store_log"
+  rm -f "$store_log"
+  if [ "$rc" -eq 0 ] || grep -q -i 'already' "$store_log" 2>/dev/null; then
+    if addon_repo_present; then
+      log "vibe_addons store registered + verified"
+      store_added=1
+      "$HA_CLI" store reload --no-progress >/dev/null 2>&1 || true
+      break
+    fi
+    log "store add returned ok but repo not yet visible — retrying"
+  else
+    log "store add returned $rc (likely transient supervisor-git race) — retrying"
+  fi
+done
+[ "$store_added" -eq 1 ] || fail "vibe_addons store failed to register after 6 attempts (~8 min)" 2
 
 # --- 3. write GHCR pull creds -----------------------------------------
 # Without these, the private ga_manager addon image pull would 401.
@@ -172,10 +212,40 @@ fi
 # `install` is idempotent — if already installed, Supervisor returns
 # the "already installed" response which `ha` treats as exit 0 on
 # recent versions. We follow with `start` which is also idempotent.
-log "installing $GA_MANAGER_SLUG"
-if ! "$HA_CLI" addons install "$GA_MANAGER_SLUG"; then
-  fail "ga_manager install failed (slug=$GA_MANAGER_SLUG)" 4
-fi
+#
+# Verify-after-install is required for the same reason as the store-add
+# pattern above: Supervisor reports success once the install JOB is
+# accepted, but the actual image pull + container create happens
+# asynchronously. We check addons_installed() (= the addon's reported
+# version is non-null) until it succeeds, with the same exp-backoff
+# budget as store-add (= same kind of supervisor-side race).
+
+addons_installed() {
+  # ha addons info --raw-json reports a "version" KEY for every store-
+  # known addon, valued null until the addon is actually installed.
+  # Check the VALUE, not just key presence.
+  _v=$("$HA_CLI" addons info "$1" --no-progress --raw-json 2>/dev/null \
+        | "$JQ_CLI" -r '(.data.version // .version // empty)' 2>/dev/null)
+  [ -n "${_v}" ] && [ "${_v}" != "null" ]
+}
+
+log "installing $GA_MANAGER_SLUG — with retry"
+addon_ready=0
+for pre_sleep in $BACKOFF_SEQUENCE; do
+  if [ "$pre_sleep" -gt 0 ]; then
+    log "waiting ${pre_sleep}s before retry..."
+    sleep "$pre_sleep"
+  fi
+  "$HA_CLI" addons install "$GA_MANAGER_SLUG" >/dev/null 2>&1 || true
+  if addons_installed "$GA_MANAGER_SLUG"; then
+    log "$GA_MANAGER_SLUG installed + verified"
+    addon_ready=1
+    break
+  fi
+  log "addon not yet installed — retrying"
+done
+[ "$addon_ready" -eq 1 ] || fail "ga_manager install failed/un-verifiable after 6 attempts (~8 min)" 4
+
 log "starting $GA_MANAGER_SLUG"
 if ! "$HA_CLI" addons start "$GA_MANAGER_SLUG"; then
   fail "ga_manager start failed (slug=$GA_MANAGER_SLUG)" 4

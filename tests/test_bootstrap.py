@@ -70,10 +70,20 @@ def test_store_add_returning_already_known_is_ok(run_bootstrap, fake_ha, bootstr
     assert Path(bootstrap_env["MARKER"]).is_file()
 
 
-def test_store_add_real_error_exits_2(run_bootstrap, fake_ha, bootstrap_env):
-    fake_ha.enqueue("store add", stdout="Network error", stderr="", code=1)
+def test_store_add_real_error_exits_2_after_all_retries(run_bootstrap, fake_ha, bootstrap_env):
+    """v1.2.0 retries store-add 6 times before giving up. We queue 6 failures
+    AND 6 empty repo-listings (so addon_repo_present always returns false),
+    then assert exit 2."""
+    for _ in range(6):
+        fake_ha.enqueue("store add", stdout="Network error", code=1)
+        # Empty repositories list = addon_repo_present returns false
+        fake_ha.enqueue(
+            "store repositories",
+            stdout='{"result":"ok","data":{"repositories":[]}}',
+            code=0,
+        )
     result = run_bootstrap()
-    assert result.returncode == 2
+    assert result.returncode == 2, result.stdout + result.stderr
     assert not Path(bootstrap_env["MARKER"]).exists()
 
 
@@ -90,8 +100,18 @@ def test_supervisor_rejects_ghcr_creds_exits_3(run_bootstrap, fake_ha, bootstrap
     assert not Path(bootstrap_env["MARKER"]).exists()
 
 
-def test_addon_install_fails_exits_4(run_bootstrap, fake_ha, bootstrap_env):
-    fake_ha.enqueue("addons install", code=1, stderr="resolve_addon failed")
+def test_addon_install_fails_exits_4_after_all_retries(run_bootstrap, fake_ha, bootstrap_env):
+    """v1.2.0 retries addons-install 6 times before giving up. We queue 6
+    install failures AND 6 'no version' addons-info responses (= verify
+    fails every time)."""
+    for _ in range(6):
+        fake_ha.enqueue("addons install", code=1, stderr="resolve_addon failed")
+        # version=null means addons_installed returns false
+        fake_ha.enqueue(
+            "addons info",
+            stdout='{"result":"ok","data":{"version":null}}',
+            code=0,
+        )
     result = run_bootstrap()
     assert result.returncode == 4
     assert not Path(bootstrap_env["MARKER"]).exists()
