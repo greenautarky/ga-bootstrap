@@ -1,9 +1,9 @@
 [Unit]
 Description=greenautarky first-boot bootstrap (install ga_manager → converge takes over)
 Documentation=https://github.com/greenautarky/ga-bootstrap
-After=hassio-supervisor.service network-online.target
+After=hassos-supervisor.service network-online.target
 Wants=network-online.target
-Requires=hassio-supervisor.service
+Requires=hassos-supervisor.service
 ConditionPathExists=!/mnt/data/.ga-bootstrapped
 
 [Service]

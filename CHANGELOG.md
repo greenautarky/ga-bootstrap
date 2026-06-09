@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.1 — 2026-06-09
+
+### Fixed — systemd dependency name (hassio- → hassos-)
+The HAOS upstream systemd unit is named `hassos-supervisor.service`, not `hassio-` (docker container is named with `hassio_`, but the systemd unit driving it is `hassos-`). Tier-2 v1.0.0/1.1.0/1.2.0 had `After=hassio-supervisor.service + Requires=hassio-supervisor.service`, which systemd silently dropped because the named unit did not exist — ga-bootstrap.service never started. Caught on K31 bench BOSv1.2.6 (2026-06-09).
+
+Fix: replace `hassio-supervisor` → `hassos-supervisor` in both After= and Requires= directives.
+
 ## 1.2.0 — 2026-06-08
 
 Reintroduces the defensive retry+verify patterns the rootfs ga-bootstrap
