@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.2.2 — 2026-06-09
+
+### Added — EnvironmentFile drop-in path
+New `EnvironmentFile=-/mnt/data/ga-bootstrap.env` directive in
+ga-bootstrap.service lets operators (and on-device tests) override
+GHCR_CREDS_FILE, BACKOFF_SEQUENCE etc. without rebuilding the OS
+image. The path is on /mnt/data (= writable ext4) because /etc/ is a
+RO squashfs on HAOS — see
+ha-operating-system memory/todo_ga_bootstrap_creds_path.
+
+Example contents of /mnt/data/ga-bootstrap.env:
+```
+GHCR_CREDS_FILE=/mnt/data/ghcr-creds.json
+BACKOFF_SEQUENCE=0 5 15 30
+```
+
+The `-` prefix on EnvironmentFile makes it optional — missing file is
+a no-op (= existing behaviour preserved).
+
+Caught by tests/ga_tests/lib/provision_test_fixture.sh on K31
+BOSv1.2.7 bench session 2026-06-09. With this fix the fixture can
+become a one-liner instead of needing a manual env override per
+invocation.
+
 ## 1.2.1 — 2026-06-09
 
 ### Fixed — systemd dependency name (hassio- → hassos-)

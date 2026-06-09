@@ -10,6 +10,13 @@ ConditionPathExists=!/mnt/data/.ga-bootstrapped
 Type=oneshot
 RemainAfterExit=yes
 TimeoutStartSec=1500
+# Optional override file under /mnt/data (= writable on HAOS, unlike /etc).
+# Lets operators / bench tests point ga-bootstrap at non-default paths
+# without rebuilding the OS image — e.g.
+#   GHCR_CREDS_FILE=/mnt/data/ghcr-creds.json
+#   BACKOFF_SEQUENCE=0 5 15 30
+# The `-` prefix makes the file optional; missing = no-op.
+EnvironmentFile=-/mnt/data/ga-bootstrap.env
 ExecStart=/usr/sbin/ga-bootstrap
 StandardOutput=journal+console
 StandardError=journal+console
