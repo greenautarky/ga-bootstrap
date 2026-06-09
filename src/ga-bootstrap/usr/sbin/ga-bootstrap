@@ -179,8 +179,12 @@ for pre_sleep in $BACKOFF_SEQUENCE; do
   store_log=$(mktemp -t ga-bootstrap-store.XXXXXX)
   "$HA_CLI" --no-progress store add "$VIBE_STORE_URL" >"$store_log" 2>&1 && rc=0 || rc=$?
   cat "$store_log"
+  # Capture output BEFORE removing the file — the "already" grep was
+  # previously running against a deleted file, so the idempotent path
+  # never fired and ga-bootstrap retried forever on a re-bootstrap.
+  store_output=$(cat "$store_log" 2>/dev/null || true)
   rm -f "$store_log"
-  if [ "$rc" -eq 0 ] || grep -q -i 'already' "$store_log" 2>/dev/null; then
+  if [ "$rc" -eq 0 ] || printf '%s' "$store_output" | grep -q -i 'already'; then
     if addon_repo_present; then
       log "vibe_addons store registered + verified"
       store_added=1

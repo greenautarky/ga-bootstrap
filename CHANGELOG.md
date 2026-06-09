@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.2.3 — 2026-06-09
+
+### Fixed — store-add idempotency: "already in store" was never honored
+
+The check `grep -q -i 'already' "$store_log"` always returned false
+because the previous line `rm -f "$store_log"` deleted the file before
+the grep ran. So on a re-bootstrap of a device whose vibe_addons store
+was already registered (= classic happens after RAUC OTA + reboot),
+`ha store add` would return non-zero with "Can't add ..., already in
+the store" on stderr — and the script interpreted this as transient,
+retried 6 times, then exit 2.
+
+Cascade impact: ga-bootstrap fail → ga_manager not installed → converge
+step 2 (custom_components placement) doesn't run → greenautarky_onboarding
+integration doesn't load → no PIN migration. The whole user-facing
+stack gets blocked on a fresh fleet upgrade.
+
+Fix: capture `store_output=$(cat "$store_log")` BEFORE the `rm -f`,
+then `grep` the variable. ~3-line patch. Verified on K7 canary 2026-06-09
+where ga-bootstrap.service had been stuck in "failed" state ~30 min
+after the BOSv1.2.9 install.
+
 ## 1.2.2 — 2026-06-09
 
 ### Added — EnvironmentFile drop-in path
