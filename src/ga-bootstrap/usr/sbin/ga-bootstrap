@@ -254,9 +254,31 @@ fi
 [ "$GHCR_CREDS_FILE_FOUND" != "$GHCR_CREDS_FILE" ] && \
   log "GHCR creds found via fallback: $GHCR_CREDS_FILE_FOUND (env/default was $GHCR_CREDS_FILE)"
 log "registering GHCR credentials with Supervisor"
-if ! "$HA_CLI" --raw-json --no-progress \
-      docker registries -f "$GHCR_CREDS_FILE_FOUND" >/dev/null 2>&1; then
-  fail "Supervisor rejected GHCR creds" 3
+# The legacy `-f <file>` flag on `ha docker registries` was removed in a
+# pre-v1.2 Supervisor CLI bump (= raises 'unknown shorthand flag: f' on
+# Supervisor 2025.11.4.5). We now parse the JSON ourselves and pass
+# host/user/pw via the CLI's `add` subcommand which is the documented
+# non-interactive path.
+# JSON format we accept (= what ga_manager writes + ga-flasher delivers):
+#   {"<host>": {"username": "<u>", "password": "<p>"}, ...}
+creds_registered=0
+for host in $("$JQ_CLI" -r 'keys[]' "$GHCR_CREDS_FILE_FOUND" 2>/dev/null); do
+  u=$("$JQ_CLI" -r --arg h "$host" '.[$h].username' "$GHCR_CREDS_FILE_FOUND")
+  p=$("$JQ_CLI" -r --arg h "$host" '.[$h].password' "$GHCR_CREDS_FILE_FOUND")
+  if [ -z "$u" ] || [ "$u" = "null" ] || [ -z "$p" ] || [ "$p" = "null" ]; then
+    log "WARN: $host entry missing username/password in $GHCR_CREDS_FILE_FOUND — skipping"
+    continue
+  fi
+  if "$HA_CLI" --no-progress docker registries add "$host" \
+       --username "$u" --password "$p" >/dev/null 2>&1; then
+    log "registered $host with Supervisor"
+    creds_registered=$((creds_registered + 1))
+  else
+    log "WARN: Supervisor refused $host registration — continuing with other hosts"
+  fi
+done
+if [ "$creds_registered" -eq 0 ]; then
+  fail "Supervisor rejected ALL hosts in $GHCR_CREDS_FILE_FOUND" 3
 fi
 
 # --- 4. install + start ga_manager ------------------------------------

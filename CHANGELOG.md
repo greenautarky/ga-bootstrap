@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.2.6 — 2026-06-10
+
+### Fixed — Supervisor CLI: `ha docker registries -f` not a valid flag
+
+`-f <file>` was removed from the `ha` CLI in a Supervisor pre-v1.2 bump.
+Live error on K7 + K31 BOSv1.2.11 reflash:
+
+  ERROR: Supervisor rejected GHCR creds
+
+caused by:
+
+  Error: unknown shorthand flag: 'f' in -f
+
+So the entire creds-registration step has been silently broken for any
+device that doesn't have a baked-in `/etc/ga/ghcr-creds.json` that
+matches `ha`'s expectations — which means the OTA-recovery path that
+1.2.4 + 1.2.5 introduced never actually worked end-to-end.
+
+This release parses the JSON ourselves with `jq` and registers each
+host via the documented `ha docker registries add <host> --username U
+--password P` flow. Idempotent (Supervisor accepts re-adds), per-host
+(one bad entry doesn't abort all).
+
+Caught 2026-06-10 on K31 fresh-flash + K7 canary OTA of BOSv1.2.11.
+
 ## 1.2.5 — 2026-06-10
 
 ### Security — retire /share/ from the GHCR creds fallback chain
