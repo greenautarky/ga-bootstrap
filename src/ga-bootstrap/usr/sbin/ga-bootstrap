@@ -200,15 +200,44 @@ done
 
 # --- 3. write GHCR pull creds -----------------------------------------
 # Without these, the private ga_manager addon image pull would 401.
-# The PAT is delivered into /etc/ga/ghcr-creds.json at OS bake time;
-# we POST it into Supervisor's registries API so subsequent pulls
-# carry the auth header.
-if [ ! -f "$GHCR_CREDS_FILE" ]; then
-  fail "$GHCR_CREDS_FILE missing — provisioner did not deliver creds" 3
+# Sources tried in priority order — first one present wins:
+#
+#   1. $GHCR_CREDS_FILE (env / EnvironmentFile override) — explicit operator path
+#   2. /etc/ga/ghcr-creds.json — OS-bake-time path (= original v1.2.x convention)
+#   3. /share/ga/ghcr-creds.json — written by ga_manager's `ghcr-creds-write`
+#      worker after fleet-manager's `ghcr-creds-push` job. Survives OTA
+#      because /share is on /mnt/data (= writable persistent partition).
+#   4. /mnt/data/ghcr-creds.json — root-only persistent fallback. Used by
+#      `tests/ga_tests/lib/provision_test_fixture.sh` on bench devices.
+#
+# Why the fallback chain (added v1.2.4): /etc/ is a RO squashfs on HAOS,
+# baked at OS image time. After a RAUC slot-switch the new squashfs has
+# no /etc/ga/ghcr-creds.json — the file belonged to the previous build.
+# Pre-1.2.4 the script exited 3 here; the whole user-facing cascade
+# (ga_manager → converge → custom_components → integration) stayed
+# blocked. The fallback paths let ga-bootstrap self-recover post-OTA as
+# long as fleet-manager has dispatched its ghcr-creds-push job (= which
+# cred_autopush.py does automatically on new-device registration).
+GHCR_CREDS_FILE_FOUND=""
+for candidate in \
+    "$GHCR_CREDS_FILE" \
+    "/etc/ga/ghcr-creds.json" \
+    "/share/ga/ghcr-creds.json" \
+    "/mnt/data/supervisor/share/ga/ghcr-creds.json" \
+    "/mnt/data/ghcr-creds.json"; do
+  if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+    GHCR_CREDS_FILE_FOUND="$candidate"
+    break
+  fi
+done
+if [ -z "$GHCR_CREDS_FILE_FOUND" ]; then
+  fail "GHCR creds missing at all candidate paths (env / /etc/ga/ / /share/ga/ / /mnt/data/) — provisioner did not deliver creds AND fleet-manager has not pushed any" 3
 fi
+[ "$GHCR_CREDS_FILE_FOUND" != "$GHCR_CREDS_FILE" ] && \
+  log "GHCR creds found via fallback: $GHCR_CREDS_FILE_FOUND (env/default was $GHCR_CREDS_FILE)"
 log "registering GHCR credentials with Supervisor"
 if ! "$HA_CLI" --raw-json --no-progress \
-      docker registries -f "$GHCR_CREDS_FILE" >/dev/null 2>&1; then
+      docker registries -f "$GHCR_CREDS_FILE_FOUND" >/dev/null 2>&1; then
   fail "Supervisor rejected GHCR creds" 3
 fi
 

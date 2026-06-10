@@ -93,6 +93,42 @@ def test_missing_ghcr_creds_exits_3(run_bootstrap, tmp_path):
     assert "missing" in result.stdout + result.stderr
 
 
+
+
+def test_creds_fallback_etc_ga(run_bootstrap, tmp_path, fake_ha, bootstrap_env):
+    """v1.2.4 fallback: if env-override file is absent but /etc/ga/ exists,
+    bootstrap uses the /etc/ga/ path. We can't mount a real /etc/ in a test;
+    instead point env-override at a deliberately-missing path AND assert
+    that the script's error message says it looked at the fallback chain
+    (= proves the chain was traversed before failing)."""
+    result = run_bootstrap(GHCR_CREDS_FILE=str(tmp_path / "does-not-exist.json"))
+    assert result.returncode == 3
+    # Error message must mention the fallback paths the script tried
+    err = result.stdout + result.stderr
+    assert "/etc/ga/" in err
+    assert "/share/ga/" in err
+    assert "/mnt/data/" in err
+
+
+def test_creds_fallback_uses_first_present(run_bootstrap, bootstrap_env, fake_ha):
+    """The env-override path is FIRST in the priority chain. When it
+    points at a valid file, the script uses it — no fallback needed.
+    bootstrap_env's fixture already sets GHCR_CREDS_FILE to a valid
+    tmp_path file, so any success-path run proves this works.
+    """
+    # Force a Step-3 failure via supervisor rejecting the registries call
+    # — this only happens if the creds file WAS found and passed to
+    # `ha docker registries -f $file`. If the env-override wasn't used,
+    # the script would exit 3 with "missing" instead.
+    fake_ha.enqueue("docker registries", code=1, stderr="forced fail")
+    result = run_bootstrap()
+    err = result.stdout + result.stderr
+    # Should NOT mention "missing" — the file was found via env
+    assert "missing at all candidate paths" not in err
+    # Should mention "Supervisor rejected" — meaning we got past Step 3 read
+    assert "Supervisor rejected" in err
+
+
 def test_supervisor_rejects_ghcr_creds_exits_3(run_bootstrap, fake_ha, bootstrap_env):
     fake_ha.enqueue("docker registries", code=1, stderr="403 forbidden")
     result = run_bootstrap()

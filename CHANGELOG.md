@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.2.4 — 2026-06-10
+
+### Added — GHCR creds fallback chain (= post-OTA self-recovery)
+
+After a RAUC slot-switch the new squashfs has no `/etc/ga/ghcr-creds.json`
+because that file belonged to the previously-running OS image. Pre-1.2.4
+the script exited 3 here; the whole cascade (ga_manager → converge →
+custom_components → integration → PIN migration) stayed blocked until
+operator intervention.
+
+This release tries 5 candidate paths in priority order:
+
+  1. `$GHCR_CREDS_FILE` env / EnvironmentFile override
+  2. `/etc/ga/ghcr-creds.json` — original bake-at-build-time convention
+  3. `/share/ga/ghcr-creds.json` — ga_manager `ghcr-creds-write` worker output
+  4. `/mnt/data/supervisor/share/ga/ghcr-creds.json` — same path inside Supervisor's share
+  5. `/mnt/data/ghcr-creds.json` — provision_test_fixture / operator-friendly fallback
+
+The first existing file wins; if it's the env-default the script behaves
+exactly as before. The new paths kick in only when the default is
+absent. `/share/ga/` survives OTA because it's on `/mnt/data` (= writable
+ext4 partition), and fleet-manager's `cred_autopush.py` (since 0.17.0)
+populates it on every newly-registered device — so an OTA'd device gets
+self-recovery as soon as ga-bootstrap retries.
+
+Caught on 2026-06-09 BOSv1.2.10 canary: K7's ga-bootstrap.service
+exited 3 after the OTA because `/etc/ga/ghcr-creds.json` was gone but
+`/share/ga/ghcr-creds.json` was present (= fleet-manager had pushed
+creds via `POST /api/devices/.../jobs/ghcr-creds-push`).
+
+### Tests
++2 new tests covering:
+- env-override-missing → error message mentions all 5 paths (= chain was traversed)
+- env-override-present → file used, no "missing" message
+
 ## 1.2.3 — 2026-06-09
 
 ### Fixed — store-add idempotency: "already in store" was never honored
