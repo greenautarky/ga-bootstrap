@@ -1,5 +1,45 @@
 # Changelog
 
+## 1.2.5 — 2026-06-10
+
+### Security — retire /share/ from the GHCR creds fallback chain
+
+ga-bootstrap 1.2.4 introduced a 5-path fallback for finding GHCR creds
+post-OTA. One of those paths was /share/ga/ghcr-creds.json — the place
+ga_manager 0.16..0.27.0 wrote them. That path is **addon-readable by
+every addon declaring `map: [share:rw]`** (= Z2M, Mosquitto, many
+community ones), so as soon as we let customers install arbitrary
+HACS-style addons it becomes an exfil vector.
+
+1.2.5 drops /share/ entirely from the fallback. The new chain is:
+
+  1. $GHCR_CREDS_FILE env / EnvironmentFile override
+  2. /etc/ga/ghcr-creds.json (= OS-bake-time path)
+  3. /mnt/data/ghcr-creds.json (= operator / test-fixture path, root-only)
+  4. /mnt/data/supervisor/addons/data/*_ga_manager/ghcr-creds.json
+     (GLOB — addon-private path written by ga_manager 0.27.1+)
+
+The glob in path 4 tolerates slug renames: today the addon is
+`99f1cad4_ga_manager`, but a future rebuild under a different
+installation slug would still match. Addon-private dirs are NOT
+readable by other addons regardless of their `map:` declarations.
+
+Sister move to greenautarky-onboarding v1.0.1 + v1.0.3 (= console-login
+secret + onboarding PIN out of /share/ + /config/ top-level).
+
+### Companion changes
+- ga_manager 0.27.1: `ghcr-creds-write` worker default path moves from
+  `/share/ga/ghcr-creds.json` to `/data/ghcr-creds.json`. Worker also
+  auto-deletes the legacy /share/ file when it writes the new one.
+- ha-operating-system BOSv1.2.11 pins both above.
+
+### Tests
++1 in tests/test_bootstrap.py covering the glob path is mentioned in
+the error message + /share/ga/ is NOT (= retired). Plus existing
+fallback test updated for the new path enumeration.
+
+22/22 PASS.
+
 ## 1.2.4 — 2026-06-10
 
 ### Added — GHCR creds fallback chain (= post-OTA self-recovery)

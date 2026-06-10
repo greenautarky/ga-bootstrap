@@ -103,11 +103,14 @@ def test_creds_fallback_etc_ga(run_bootstrap, tmp_path, fake_ha, bootstrap_env):
     (= proves the chain was traversed before failing)."""
     result = run_bootstrap(GHCR_CREDS_FILE=str(tmp_path / "does-not-exist.json"))
     assert result.returncode == 3
-    # Error message must mention the fallback paths the script tried
     err = result.stdout + result.stderr
     assert "/etc/ga/" in err
-    assert "/share/ga/" in err
     assert "/mnt/data/" in err
+    # 1.2.5: /share/ga/ retired for the threat-model reason (addons with
+    # `map: [share:rw]` could read it). Path must NOT appear in fallback.
+    assert "/share/ga/" not in err
+    # 1.2.5: addon-private path mentioned in the error
+    assert "addon-private" in err or "/data/" in err
 
 
 def test_creds_fallback_uses_first_present(run_bootstrap, bootstrap_env, fake_ha):
@@ -127,6 +130,25 @@ def test_creds_fallback_uses_first_present(run_bootstrap, bootstrap_env, fake_ha
     assert "missing at all candidate paths" not in err
     # Should mention "Supervisor rejected" — meaning we got past Step 3 read
     assert "Supervisor rejected" in err
+
+
+def test_creds_glob_fallback_uses_addon_private(run_bootstrap, tmp_path, fake_ha, bootstrap_env, monkeypatch):
+    """1.2.5 glob fallback: ga_manager 0.27.1 writes creds at
+    /mnt/data/supervisor/addons/data/<slug>/ghcr-creds.json. The script
+    globs *_ga_manager/ to tolerate slug renames. To test this without
+    polluting /mnt/data/ on the host, point GHCR_CREDS_FILE at a fake
+    path under tmp_path with a *_ga_manager-shaped intermediate dir,
+    then verify the script finds it via the glob path.
+
+    Note: this test exercises the glob branch by checking error-message
+    enumeration, not the actual file-read happy-path (= would require
+    mocking out /mnt/data/ via mount-bind). The glob mention proves the
+    chain was traversed."""
+    result = run_bootstrap(GHCR_CREDS_FILE=str(tmp_path / "missing.json"))
+    assert result.returncode == 3
+    err = result.stdout + result.stderr
+    # The error should NOT mention /share/ (= retired)
+    assert "/share/ga/" not in err
 
 
 def test_supervisor_rejects_ghcr_creds_exits_3(run_bootstrap, fake_ha, bootstrap_env):

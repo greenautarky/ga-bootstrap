@@ -1,6 +1,6 @@
 [project]
 name = "ga-bootstrap"
-version = "1.2.4"
+version = "1.2.5"
 description = "First-boot orchestrator for GreenAutarky devices — installs ga_manager addon and hands off to converge"
 authors = [{name = "Thomas Taube", email = "thomas@greenautarky.com"}]
 license = {text = "Proprietary"}

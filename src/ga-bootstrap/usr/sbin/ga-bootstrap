@@ -204,11 +204,19 @@ done
 #
 #   1. $GHCR_CREDS_FILE (env / EnvironmentFile override) — explicit operator path
 #   2. /etc/ga/ghcr-creds.json — OS-bake-time path (= original v1.2.x convention)
-#   3. /share/ga/ghcr-creds.json — written by ga_manager's `ghcr-creds-write`
-#      worker after fleet-manager's `ghcr-creds-push` job. Survives OTA
-#      because /share is on /mnt/data (= writable persistent partition).
+#   3. /mnt/data/supervisor/addons/data/*_ga_manager/ghcr-creds.json — glob over
+#      ga_manager's addon-private dir, where ga_manager 0.27.1+ writes via
+#      its /data/ mount. The wildcard before "_ga_manager" tolerates slug
+#      renames (= today 99f1cad4_ga_manager, but a slug bump wouldn't
+#      break this script). Survives OTA + NOT readable by any other addon.
 #   4. /mnt/data/ghcr-creds.json — root-only persistent fallback. Used by
 #      `tests/ga_tests/lib/provision_test_fixture.sh` on bench devices.
+#
+# /share/ga/ghcr-creds.json was RETIRED in 1.2.5 (= same release as
+# ga_manager 0.27.1) — that path is addon-readable by any addon with
+# `map: [share:rw]` (= Z2M, Mosquitto, many community ones). See
+# greenautarky-onboarding v1.0.1 + v1.0.3 sister moves for the same
+# threat-model fix.
 #
 # Why the fallback chain (added v1.2.4): /etc/ is a RO squashfs on HAOS,
 # baked at OS image time. After a RAUC slot-switch the new squashfs has
@@ -219,19 +227,29 @@ done
 # long as fleet-manager has dispatched its ghcr-creds-push job (= which
 # cred_autopush.py does automatically on new-device registration).
 GHCR_CREDS_FILE_FOUND=""
+# Round 1: literal paths (= cheap, common case)
 for candidate in \
     "$GHCR_CREDS_FILE" \
     "/etc/ga/ghcr-creds.json" \
-    "/share/ga/ghcr-creds.json" \
-    "/mnt/data/supervisor/share/ga/ghcr-creds.json" \
     "/mnt/data/ghcr-creds.json"; do
   if [ -n "$candidate" ] && [ -f "$candidate" ]; then
     GHCR_CREDS_FILE_FOUND="$candidate"
     break
   fi
 done
+# Round 2: glob ga_manager's addon-private path. Only if no literal hit.
+# The slug pattern *_ga_manager covers today's 99f1cad4_ga_manager and
+# any future re-build of the addon under a different installation slug.
 if [ -z "$GHCR_CREDS_FILE_FOUND" ]; then
-  fail "GHCR creds missing at all candidate paths (env / /etc/ga/ / /share/ga/ / /mnt/data/) — provisioner did not deliver creds AND fleet-manager has not pushed any" 3
+  for candidate in /mnt/data/supervisor/addons/data/*_ga_manager/ghcr-creds.json; do
+    if [ -f "$candidate" ]; then
+      GHCR_CREDS_FILE_FOUND="$candidate"
+      break
+    fi
+  done
+fi
+if [ -z "$GHCR_CREDS_FILE_FOUND" ]; then
+  fail "GHCR creds missing at all candidate paths (env / /etc/ga/ / /mnt/data/ / addon-private /data/) — provisioner did not deliver creds AND fleet-manager has not pushed any" 3
 fi
 [ "$GHCR_CREDS_FILE_FOUND" != "$GHCR_CREDS_FILE" ] && \
   log "GHCR creds found via fallback: $GHCR_CREDS_FILE_FOUND (env/default was $GHCR_CREDS_FILE)"
