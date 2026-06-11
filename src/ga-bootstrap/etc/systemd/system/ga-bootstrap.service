@@ -26,5 +26,23 @@ StandardError=journal+console
 # fix things rather than getting an unreachable device.
 SuccessExitStatus=0
 
+# v1.2.7 — auto-retry on transient failures (creds-missing, supervisor
+# not ready yet, etc). Without this, operators had to manually
+# `systemctl reset-failed && systemctl start` after fleet-manager
+# pushed creds — the K7/K0/K17 BOSv1.2.12 cascade 2026-06-10. With
+# Restart=on-failure + the existing ConditionPathExists=!marker, the
+# unit retries automatically until creds appear OR StartLimitBurst is
+# hit. Once the marker `/mnt/data/.ga-bootstrapped` is written, retry
+# stops anyway (= Condition gate fires).
+#
+# RestartSec=180 (3 min) balances responsiveness vs storm-avoidance.
+# StartLimitBurst=10 in 3600s (1h) caps the loop — after that operator
+# must intervene so we don't hide a permanent problem behind infinite
+# retries.
+Restart=on-failure
+RestartSec=180
+StartLimitBurst=10
+StartLimitIntervalSec=3600
+
 [Install]
 WantedBy=multi-user.target

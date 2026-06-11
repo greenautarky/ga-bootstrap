@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.2.7 — 2026-06-11
+
+### Added — Auto-retry on transient failures (creds-missing race)
+
+`ga-bootstrap.service` unit now declares:
+
+```
+Restart=on-failure
+RestartSec=180
+StartLimitBurst=10
+StartLimitIntervalSec=3600
+```
+
+So when ga-bootstrap exits 3 because creds aren't yet on the device,
+systemd auto-retries every 3 min. Combined with fleet-manager's
+`POST /api/devices/{id}/jobs/ghcr-creds-push` (= 0.27.1 worker writes
+to /data/) and the v1.2.5 glob fallback chain (= reads from /data/),
+this means OTA-recovered devices SELF-HEAL without operator action.
+
+Cap: 10 retries within 1 hour (= 30 min sustained loop). After that
+systemd gives up + operator must `systemctl reset-failed && start`.
+This prevents hiding a permanent problem behind infinite retries.
+
+`ConditionPathExists=!/mnt/data/.ga-bootstrapped` (= pre-existing)
+guarantees that once bootstrap succeeds + writes the marker, no
+further retries fire on subsequent reboots.
+
+Closes the manual-recovery step that K7/K0/K17 BOSv1.2.12 cascade
+2026-06-10 needed.
+
 ## 1.2.6 — 2026-06-10
 
 ### Fixed — Supervisor CLI: `ha docker registries -f` not a valid flag
