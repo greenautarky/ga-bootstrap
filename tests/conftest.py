@@ -143,6 +143,75 @@ sys.exit(code)
     return controller
 
 
+@dataclass
+class FakeDocker:
+    """Controller for the shimmed `docker` binary.
+
+    Mirrors `FakeHA` — tests enqueue responses keyed on a 2-word verb
+    prefix ("exec hassio_cli"). Each enqueue() consumes a response slot.
+    Defaults handle the common `docker exec hassio_cli sh -c '...wget...'`
+    path the bootstrap script uses to call the Supervisor security API:
+    return ``{"result":"ok","data":{}}`` so the happy path passes.
+    """
+
+    responses: dict[str, list[tuple[str, str, int]]] = field(default_factory=dict)
+    invocations: list[list[str]] = field(default_factory=list)
+
+    def enqueue(self, verb_prefix: str, *, stdout: str = "",
+                stderr: str = "", code: int = 0) -> None:
+        self.responses.setdefault(verb_prefix, []).append((stdout, stderr, code))
+
+
+@pytest.fixture
+def fake_docker(tmp_path: Path, fake_ha: FakeHA,
+                monkeypatch: pytest.MonkeyPatch) -> FakeDocker:
+    """Stand-in for the host `docker` binary so the bootstrap's
+    `docker exec hassio_cli sh -c '...'` API calls don't hit a real
+    daemon. Reuses fake_ha's bin dir so both shims live on the same
+    PATH prefix."""
+    state_path = tmp_path / "fake_docker_state.json"
+    log_path = tmp_path / "fake_docker_calls.jsonl"
+    bin_dir = tmp_path / "bin"
+    # bin_dir already exists from fake_ha
+    fake_path = bin_dir / "docker"
+    fake_path.write_text(
+        f"""#!{os.path.realpath('/usr/bin/env')} python3
+import json, sys
+from pathlib import Path
+STATE = Path({str(state_path)!r})
+LOG = Path({str(log_path)!r})
+args = sys.argv[1:]
+LOG.write_text((LOG.read_text() if LOG.exists() else '') + json.dumps(args) + '\\n')
+# Match on the first two args (typically "exec hassio_cli").
+key = ' '.join(args[:2])
+state = json.loads(STATE.read_text()) if STATE.exists() else {{}}
+queue = state.get(key, [])
+if queue:
+    stdout, stderr, code = queue[0]
+    state[key] = queue[1:]
+    STATE.write_text(json.dumps(state))
+else:
+    # Default: assume the call is the Supervisor security API POST and
+    # return the canonical success shape. The bootstrap script greps
+    # for "result":"ok" to decide whether to proceed.
+    stdout, stderr, code = '{{"result":"ok","data":{{}}}}', '', 0
+sys.stdout.write(stdout)
+sys.stderr.write(stderr)
+sys.exit(code)
+"""
+    )
+    fake_path.chmod(0o755)
+
+    controller = FakeDocker()
+
+    def _flush_state() -> None:
+        state_path.write_text(json.dumps(controller.responses))
+
+    controller._flush_state = _flush_state  # type: ignore[attr-defined]
+    controller._log_path = log_path  # type: ignore[attr-defined]
+    return controller
+
+
 @pytest.fixture
 def bootstrap_env(tmp_path: Path) -> dict[str, str]:
     marker = tmp_path / "marker"
@@ -167,11 +236,14 @@ def bootstrap_env(tmp_path: Path) -> dict[str, str]:
 
 
 @pytest.fixture
-def run_bootstrap(fake_ha: FakeHA, bootstrap_env: dict[str, str], monkeypatch: pytest.MonkeyPatch):
+def run_bootstrap(fake_ha: FakeHA, fake_docker: FakeDocker,
+                  bootstrap_env: dict[str, str],
+                  monkeypatch: pytest.MonkeyPatch):
     """Returns a callable: `run_bootstrap(**overrides) -> CompletedProcess`."""
 
     def _run(**overrides):
         fake_ha._flush_state()  # type: ignore[attr-defined]
+        fake_docker._flush_state()  # type: ignore[attr-defined]
         env = {**os.environ, **bootstrap_env, **overrides}
         result = subprocess.run(
             ["/bin/sh", str(BOOTSTRAP_SCRIPT)],
@@ -186,6 +258,12 @@ def run_bootstrap(fake_ha: FakeHA, bootstrap_env: dict[str, str], monkeypatch: p
         result.ha_calls = (  # type: ignore[attr-defined]
             [json.loads(line) for line in log_path.read_text().splitlines()]
             if log_path.exists()
+            else []
+        )
+        docker_log_path = fake_docker._log_path  # type: ignore[attr-defined]
+        result.docker_calls = (  # type: ignore[attr-defined]
+            [json.loads(line) for line in docker_log_path.read_text().splitlines()]
+            if docker_log_path.exists()
             else []
         )
         return result

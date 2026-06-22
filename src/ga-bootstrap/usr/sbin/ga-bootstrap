@@ -324,6 +324,40 @@ if ! "$HA_CLI" addons start "$GA_MANAGER_SLUG"; then
   fail "ga_manager start failed (slug=$GA_MANAGER_SLUG)" 4
 fi
 
+# --- 3a. force protected=false on ga_manager --------------------------
+# Why: Supervisor's install default is `protected=true` — a sane override
+# for community-installed addons that prevents the addon from receiving
+# the dangerous permissions its manifest declares (docker_api,
+# full_access, host_pid, privileged). For ga_manager that's WRONG: the
+# addon is operator-trusted (= part of the OS image), and it NEEDS
+# docker_api access so its self-update path can run
+# `docker exec hassio_cli ha addons update <slug>` against the host
+# Docker daemon. Without protected=false the docker.sock bind is silently
+# omitted; later `docker exec hassio_cli ha addons update <slug>` fails
+# with "Cannot connect to Docker daemon".
+#
+# Discovered 2026-06-22 when K49's fleet-manager-dispatched addon-update
+# jobs broke + a fleet sweep found K31 (= just-reflashed) also had the
+# bug. K0/K6/K7/K10/K17 had been operator-toggled manually long ago.
+# See ha-operating-system memory:bug_k49_supervisor_docker_sock_missing
+# and todo_ga_bootstrap_force_protected_false_2026_06_22.
+#
+# Best-effort: if the API call fails, log + continue. The addon will run
+# but its self-update path will be broken until an operator fixes it.
+log "disabling protected mode on $GA_MANAGER_SLUG (= enables docker_api self-update path)"
+if docker exec hassio_cli sh -c 'wget -qO- \
+    --header="Authorization: Bearer $SUPERVISOR_TOKEN" \
+    --header="Content-Type: application/json" \
+    --post-data="{\"protected\": false}" \
+    "http://supervisor/addons/'"$GA_MANAGER_SLUG"'/security"' \
+    2>/dev/null | grep -q '"result":"ok"'; then
+  log "protected=false applied — restarting $GA_MANAGER_SLUG to pick up correct binds"
+  "$HA_CLI" addons restart "$GA_MANAGER_SLUG" >/dev/null 2>&1 || \
+    log "WARN: restart after protected=false toggle failed — addon will pick up on next manual restart"
+else
+  log "WARN: could not disable protected mode on $GA_MANAGER_SLUG — fleet-manager-dispatched addon-update jobs will fail until an operator fixes this manually (see ha-operating-system memory:bug_k49_supervisor_docker_sock_missing_2026_06_21)"
+fi
+
 # --- 4a. wait for HA Core ready ---------------------------------------
 # Absorbs ga-ha-init's wait. We want ga-bootstrap to exit only once
 # the device is fully reachable end-to-end — that's the contract a
