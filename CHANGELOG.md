@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.8 — 2026-06-24
+
+### Fixed — force `protected=false` on the ga_manager addon post-install
+
+After installing/priming the ga_manager addon, ga-bootstrap now POSTs
+`{protected: false}` to the Supervisor security API for the addon. This
+enables ga_manager's `docker_api` self-update path out of the box —
+pre-1.2.8 fresh-flash devices needed a manual operator toggle, the root
+cause of the K49 / K31 "Supervisor docker.sock missing" incident
+(2026-06-21). Idempotent; runs once post-install.
+
+> Released 2026-06-24: the code landed on main as 1.2.8 (pyproject) but
+> the `v1.2.8` tag / OCI artifact was never cut, so the `version.yaml`
+> pin in ha-operating-system could not be vendored at build time. This
+> release publishes it.
+
 ## 1.2.7 — 2026-06-11
 
 ### Added — Auto-retry on transient failures (creds-missing race)
