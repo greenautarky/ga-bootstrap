@@ -420,3 +420,45 @@ def test_protected_false_endpoint_carries_addon_slug(
         f"expected /addons/{custom_slug}/security to appear in docker exec args; "
         f"docker_calls={docker_calls}"
     )
+
+
+GATE_MSG = (
+    "Error: 'StoreManager.add_repository' blocked from execution, "
+    "supervisor needs to be updated first"
+)
+
+
+def test_store_add_supervisor_gate_triggers_gated_update(run_bootstrap, fake_ha, bootstrap_env):
+    """Supervisor-gate deadlock fix (2026-07-14, KIB-SON-00000055):
+    when store add is blocked with "supervisor needs to be updated
+    first" (image supervisor older than channel + auto_update=false),
+    the script must trigger the gated `ha supervisor update` itself and
+    then succeed on the retry."""
+    fake_ha.enqueue("store add", stdout=GATE_MSG, code=1)
+    # retry #2 uses the default "Store added" success + default repo listing.
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert Path(bootstrap_env["MARKER"]).is_file()
+
+    flat = [" ".join(c) for c in result.ha_calls]
+    update_calls = [i for i, s in enumerate(flat) if "supervisor update" in s]
+    assert len(update_calls) == 1, f"expected exactly one supervisor update, got {flat}"
+    store_adds = [i for i, s in enumerate(flat) if "store add" in s]
+    assert store_adds[0] < update_calls[0] < store_adds[-1], (
+        "supervisor update must run between the gated store add and the retry"
+    )
+
+
+def test_store_add_supervisor_gate_updates_only_once(run_bootstrap, fake_ha, bootstrap_env):
+    """If the gate message persists (update did not help / offline), the
+    update is attempted exactly ONCE — the loop must not hammer
+    `ha supervisor update` on every retry — and the run still exits 2
+    after the retry budget."""
+    for _ in range(6):
+        fake_ha.enqueue("store add", stdout=GATE_MSG, code=1)
+    result = run_bootstrap()
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert not Path(bootstrap_env["MARKER"]).exists()
+
+    flat = [" ".join(c) for c in result.ha_calls]
+    assert sum("supervisor update" in s for s in flat) == 1

@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.2.9 — 2026-07-14
+
+### Fixed — first-boot deadlock when the baked supervisor lags the channel
+
+The Supervisor gates all StoreManager mutations behind "supervisor needs
+to be updated first" whenever its version is older than the channel's —
+and GA OS ships `auto_update=false` by design, so nobody ever ran that
+update: `store add` failed on every retry and first boot deadlocked in
+the backoff loop (observed 2026-07-14 on KIB-SON-00000055, image baked
+2025.11.4.5 vs channel 2025.11.4.6; recovered manually with
+`ha supervisor update`).
+
+ga-bootstrap now detects that specific gate message and triggers the
+gated `ha supervisor update` itself — exactly once per run; it only ever
+moves to the version the channel already demands — then lets the
+existing backoff ride out the supervisor's restart window.
+
 ## 1.2.8 — 2026-06-24
 
 ### Fixed — force `protected=false` on the ga_manager addon post-install

@@ -167,6 +167,7 @@ addon_repo_present() {
 
 log "adding vibe_addons store ($VIBE_STORE_URL) — with retry"
 store_added=0
+sup_gate_update_done=0
 for pre_sleep in $BACKOFF_SEQUENCE; do
   if [ "$pre_sleep" -gt 0 ]; then
     log "waiting ${pre_sleep}s before retry..."
@@ -192,6 +193,26 @@ for pre_sleep in $BACKOFF_SEQUENCE; do
       break
     fi
     log "store add returned ok but repo not yet visible — retrying"
+  elif printf '%s' "$store_output" | grep -q -i 'supervisor needs to be updated'; then
+    # The Supervisor gates ALL StoreManager mutations behind "update me
+    # first" whenever its version lags the channel's — and GA OS ships
+    # auto_update=false by design, so nobody else will ever run that
+    # update: first boot deadlocks right here. Observed 2026-07-14 on
+    # KIB-SON-00000055 (image baked 2025.11.4.5, channel 2025.11.4.6).
+    # Trigger the gated update ONCE — it only ever moves to the version
+    # the channel already demands — then let the normal backoff ride
+    # out the supervisor's restart window.
+    if [ "$sup_gate_update_done" -eq 0 ]; then
+      sup_gate_update_done=1
+      log "store ops gated on a supervisor update (image older than channel) — running 'ha supervisor update'"
+      if "$HA_CLI" supervisor update --no-progress >/dev/null 2>&1; then
+        log "supervisor update accepted — retrying store add after backoff"
+      else
+        log "supervisor update call failed (supervisor restarting? offline?) — retrying store add anyway"
+      fi
+    else
+      log "store ops still gated after the supervisor update attempt — retrying"
+    fi
   else
     log "store add returned $rc (likely transient supervisor-git race) — retrying"
   fi
