@@ -157,6 +157,8 @@ fi
 addon_repo_present() {
   # ha store repositories --raw-json lists configured repos under .data.
   # Compare source URLs with trailing-slash normalisation.
+  # shellcheck disable=SC2016  # $url is a JQ variable bound by --arg, not a
+  # shell variable — single quotes are required, not a mistake.
   "$HA_CLI" store repositories --no-progress --raw-json 2>/dev/null \
     | "$JQ_CLI" -e --arg url "$VIBE_STORE_URL" '
         (.data.repositories // .repositories // .data // [])
@@ -299,7 +301,9 @@ log "registering GHCR credentials with Supervisor"
 #   {"<host>": {"username": "<u>", "password": "<p>"}, ...}
 creds_registered=0
 for host in $("$JQ_CLI" -r 'keys[]' "$GHCR_CREDS_FILE_FOUND" 2>/dev/null); do
+  # shellcheck disable=SC2016  # $h is a JQ variable bound by --arg above.
   u=$("$JQ_CLI" -r --arg h "$host" '.[$h].username' "$GHCR_CREDS_FILE_FOUND")
+  # shellcheck disable=SC2016  # ditto
   p=$("$JQ_CLI" -r --arg h "$host" '.[$h].password' "$GHCR_CREDS_FILE_FOUND")
   if [ -z "$u" ] || [ "$u" = "null" ] || [ -z "$p" ] || [ "$p" = "null" ]; then
     log "WARN: $host entry missing username/password in $GHCR_CREDS_FILE_FOUND — skipping"

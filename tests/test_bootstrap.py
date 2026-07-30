@@ -132,7 +132,9 @@ def test_creds_fallback_uses_first_present(run_bootstrap, bootstrap_env, fake_ha
     assert "Supervisor rejected" in err
 
 
-def test_creds_glob_fallback_uses_addon_private(run_bootstrap, tmp_path, fake_ha, bootstrap_env, monkeypatch):
+def test_creds_glob_fallback_uses_addon_private(
+    run_bootstrap, tmp_path, fake_ha, bootstrap_env, monkeypatch,
+):
     """1.2.5 glob fallback: ga_manager 0.27.1 writes creds at
     /mnt/data/supervisor/addons/data/<slug>/ghcr-creds.json. The script
     globs *_ga_manager/ to tolerate slug renames. To test this without
