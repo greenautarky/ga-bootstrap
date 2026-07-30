@@ -1,3 +1,34 @@
+## 1.2.9 — 2026-07-30
+
+### fix: lift a blocking Supervisor job condition instead of retrying it for 8 minutes
+
+`ha store add` can fail with `'StoreManager.add_repository' blocked from
+execution, supervisor needs to be updated first`. That is a **job condition**,
+not the transient supervisor-git race the retry loop was built for — retrying it
+six times over eight minutes changes nothing, and then bootstrap gives up.
+
+Measured on K31 2026-07-30: the OS build was baking supervisor 2025.11.4.5 while
+devices poll 2025.11.4.6, so `supervisor_updated` tripped on **every freshly
+flashed device**. No store, no add-ons, no ga_manager, no provisioning — and no
+error anywhere except this log. The device boots, answers on serial, has a
+correct keyring, and is inert.
+
+ha-operating-system#295 removes that cause. This removes the dependency on the
+cause staying fixed: a device that cannot register its store cannot be repaired
+remotely, so that must not hinge on a version comparison being perfect.
+
+The script now recognises the message, lifts the condition with
+`ha jobs options --ignore-conditions supervisor_updated`, and retries the store
+add immediately rather than burning a backoff step.
+
+Deliberate trade-off: `ignore-conditions` is persistent Supervisor state, so the
+condition stays ignored afterwards. That is the cheaper failure. Explicitly
+**not** `supervisor update`, which triggers the armv7 Core image flip — pinned
+by its own test so nobody "simplifies" it later.
+
+Verified red-before-green: with the script reverted the new test fails on
+"did not lift the blocking job condition".
+
 # Changelog
 
 ## 1.2.8 — 2026-06-24
