@@ -192,6 +192,42 @@ for pre_sleep in $BACKOFF_SEQUENCE; do
       break
     fi
     log "store add returned ok but repo not yet visible — retrying"
+  elif printf '%s' "$store_output" | grep -q -i 'blocked from execution'; then
+    # NOT a transient race — a Supervisor JOB CONDITION, and retrying it for
+    # eight minutes changes nothing. The one that bites here is
+    # `supervisor_updated`: Supervisor refuses StoreManager work whenever it
+    # considers itself out of date, i.e. whenever the baked version is older
+    # than the channel advertises.
+    #
+    # Measured on K31 2026-07-30. The build was baking supervisor 2025.11.4.5
+    # from a stale branch while devices poll 2025.11.4.6, so EVERY freshly
+    # flashed device hit this: no store, no add-ons, no ga_manager, no
+    # provisioning — and no error anywhere except this log. The device boots,
+    # answers on serial, looks healthy, and is inert.
+    #
+    # ha-operating-system#295 removes the cause. This removes the dependency
+    # on that cause staying fixed: a device that cannot register its store is
+    # useless, and that must not hinge on a version comparison being perfect.
+    #
+    # Trade-off, deliberate: `jobs options --ignore-conditions` is persistent
+    # Supervisor state, so the condition stays ignored afterwards. That is the
+    # cheaper failure — an unprovisionable device cannot be fixed remotely at
+    # all. Explicitly NOT `supervisor update`, which triggers the armv7 Core
+    # image flip (2026-06-23).
+    log "store add BLOCKED by a supervisor job condition — not transient, lifting it"
+    printf '%s' "$store_output" | head -2 | while IFS= read -r l; do log "  supervisor: $l"; done
+    if "$HA_CLI" jobs options --ignore-conditions supervisor_updated --no-progress >/dev/null 2>&1; then
+      log "lifted supervisor_updated condition — retrying store add immediately"
+      if "$HA_CLI" --no-progress store add "$VIBE_STORE_URL" >/dev/null 2>&1 && addon_repo_present; then
+        log "vibe_addons store registered + verified (after lifting the condition)"
+        store_added=1
+        "$HA_CLI" store reload --no-progress >/dev/null 2>&1 || true
+        break
+      fi
+      log "still not registered after lifting — falling through to backoff"
+    else
+      log "WARN: could not lift the job condition — the store will stay blocked"
+    fi
   else
     log "store add returned $rc (likely transient supervisor-git race) — retrying"
   fi

@@ -420,3 +420,50 @@ def test_protected_false_endpoint_carries_addon_slug(
         f"expected /addons/{custom_slug}/security to appear in docker exec args; "
         f"docker_calls={docker_calls}"
     )
+
+
+def test_blocked_job_condition_is_lifted_not_retried(run_bootstrap, fake_ha, bootstrap_env):
+    """A Supervisor job condition is not a transient race, and retrying it for
+    eight minutes changes nothing.
+
+    Measured on K31 2026-07-30: the build baked a supervisor one version older
+    than the channel advertised, so `supervisor_updated` blocked
+    StoreManager.add_repository on EVERY freshly flashed device. ga-bootstrap
+    retried six times, gave up, and the device was left with no store, no
+    add-ons and no ga_manager — booting fine and completely inert.
+
+    The script must recognise the condition, lift it, and retry immediately.
+    """
+    fake_ha.enqueue(
+        "store add",
+        stdout="Error: 'StoreManager.add_repository' blocked from execution, "
+               "supervisor needs to be updated first",
+        code=1,
+    )
+    # After lifting the condition the retry succeeds and the repo shows up.
+    result = run_bootstrap()
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert Path(bootstrap_env["MARKER"]).is_file()
+    assert _called(result, "jobs options"), (
+        "ga-bootstrap did not lift the blocking job condition — it will retry "
+        "for eight minutes and then leave the device unprovisionable"
+    )
+    assert any("ignore-conditions" in " ".join(c) and "supervisor_updated" in " ".join(c)
+               for c in result.ha_calls), "wrong condition lifted"
+
+
+def test_the_lift_is_not_supervisor_update(run_bootstrap, fake_ha):
+    """`supervisor update` would also clear the condition — and trigger the
+    armv7 Core image flip (2026-06-23). Pinned so nobody 'simplifies' it."""
+    fake_ha.enqueue(
+        "store add",
+        stdout="Error: 'StoreManager.add_repository' blocked from execution, "
+               "supervisor needs to be updated first",
+        code=1,
+    )
+    result = run_bootstrap()
+    assert not any(
+        " ".join(c).startswith("supervisor update") or " supervisor update" in " ".join(c)
+        for c in result.ha_calls
+    ), "ga-bootstrap ran `supervisor update` — that flips the armv7 Core image"
