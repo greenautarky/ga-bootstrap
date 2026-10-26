@@ -45,6 +45,11 @@ class FakeHA:
     responses: dict[str, list[tuple[str, str, int]]] = field(default_factory=dict)
     invocations: list[list[str]] = field(default_factory=list)
 
+    def addon_missing(self, mode: str) -> None:
+        """Make `addons info` answer "does not exist": mode "until_restart"
+        (cleared by `ha supervisor restart`) or "always"."""
+        self.responses.setdefault("__flags__", {})["addon_missing"] = mode  # type: ignore[index]
+
     def enqueue(
         self,
         verb_prefix: str,
@@ -78,13 +83,31 @@ key = ' '.join(clean[:2])
 LOG.write_text((LOG.read_text() if LOG.exists() else '') + json.dumps(args) + '\\n')
 state = json.loads(STATE.read_text()) if STATE.exists() else {{}}
 queue = state.get(key, [])
-if queue:
+flags = state.get('__flags__', {{}})
+if key == 'supervisor restart':
+    # Stateful: a Supervisor restart is what reloads a re-cloned store
+    # (a canary, 2026-10-23). Count restarts for at-most-once asserts.
+    flags['restarts'] = flags.get('restarts', 0) + 1
+    state['__flags__'] = flags
+    STATE.write_text(json.dumps(state))
+_missing = (
+    flags.get('addon_missing') == 'always'
+    or (flags.get('addon_missing') == 'until_restart' and not flags.get('restarts'))
+)
+if key == 'addons info' and _missing:
+    # Real Supervisor reply for an add-on no loaded store knows about.
+    stdout, stderr, code = (
+        '{{"result":"error","message":"Addon ' + clean[2] + ' does not exist"}}', '', 1,
+    )
+elif queue:
     stdout, stderr, code = queue[0]
     state[key] = queue[1:]
     STATE.write_text(json.dumps(state))
 else:
     # Default per verb — must satisfy the script's grep / exit-check.
-    if key == 'supervisor info':
+    if key == 'supervisor restart':
+        stdout, stderr, code = '', '', 0
+    elif key == 'supervisor info':
         # Provide BOTH the result=ok signal AND the data.auto_update field
         # since step 1a (auto_update=false) also parses this response.
         stdout, stderr, code = '{{"result":"ok","data":{{"auto_update":false}}}}', '', 0
