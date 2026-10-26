@@ -1,3 +1,23 @@
+## 1.2.10 — 2026-10-26
+
+### fix: recover when the GA add-on store is registered but its add-ons never load (Odoo #1337)
+
+Measured 2026-10-23 on a canary (BOSv1.5.2-rc2, first boot): a hard
+power cycle during the first clone of `vibe_addons` (slug 99f1cad4) left
+`repository.json` zero-length. Supervisor reset and re-cloned the store, but the
+add-on list stayed empty — `ha addons info 99f1cad4_ga_manager` answered "does
+not exist", `ha store reload` / `ha addons reload` did not help. Bootstrap
+retried 6 times (~8 min) and exited 4. `ha supervisor restart` fixed it within
+seconds.
+
+The install retry loop now runs a one-time recovery ladder when the add-on
+**does not exist** although the store is registered: (1) `ha store reload`,
+re-check; (2) if still absent, ONE `ha supervisor restart`, wait until the
+Supervisor answers, re-check; then the normal install retries continue. Every
+rung logs at WARN with what it observed. At most one Supervisor restart per run;
+never when the add-on exists (install failing for another reason keeps the old
+behaviour). Verified red-before-green in the fake-`ha` harness.
+
 ## 1.2.9 — 2026-07-30
 
 ### fix: lift a blocking Supervisor job condition instead of retrying it for 8 minutes

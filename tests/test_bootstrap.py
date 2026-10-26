@@ -469,3 +469,72 @@ def test_the_lift_is_not_supervisor_update(run_bootstrap, fake_ha):
         " ".join(c).startswith("supervisor update") or " supervisor update" in " ".join(c)
         for c in result.ha_calls
     ), "ga-bootstrap ran `supervisor update` — that flips the armv7 Core image"
+
+
+# --- store-recovery ladder (Odoo #1337) ---------------------------------
+# Measured on a canary (BOSv1.5.2-rc2, 2026-10-23): power cut during
+# the first store clone -> zero-length repository.json -> Supervisor reset +
+# re-cloned the store, but `ha addons info 99f1cad4_ga_manager` said "does not
+# exist" until `ha supervisor restart`. Bootstrap gave up after 6 attempts.
+
+
+def _count(result, verb_prefix: str) -> int:
+    return sum(1 for call in result.ha_calls if verb_prefix in " ".join(call))
+
+
+def test_addon_missing_until_supervisor_restart_recovers(run_bootstrap, fake_ha, bootstrap_env):
+    fake_ha.addon_missing("until_restart")
+    result = run_bootstrap()
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert Path(bootstrap_env["MARKER"]).is_file()
+    assert _count(result, "supervisor restart") == 1, out
+    # rung 1 (store reload) ran before rung 2 (restart)
+    flat = [" ".join(c) for c in result.ha_calls]
+    restart_idx = flat.index(next(s for s in flat if "supervisor restart" in s))
+    assert any("store reload" in s for s in flat[:restart_idx])
+    assert "WARN: rung 1" in out and "WARN: rung 2" in out
+
+
+def test_addon_present_first_try_no_reload_no_restart(run_bootstrap, fake_ha):
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout
+    assert _count(result, "supervisor restart") == 0
+    assert "rung" not in result.stdout
+    # store reload only from step 2's post-register reload, never from the ladder
+    assert _count(result, "store reload") == 1
+
+
+def test_addon_known_but_install_failing_never_restarts(run_bootstrap, fake_ha):
+    """Add-on EXISTS (version null) but install fails: old behaviour, no ladder."""
+    for _ in range(6):
+        fake_ha.enqueue("addons install", code=1, stderr="pull failed")
+        fake_ha.enqueue("addons info", stdout='{"result":"ok","data":{"version":null}}')
+    result = run_bootstrap()
+    assert result.returncode == 4
+    assert _count(result, "supervisor restart") == 0
+    assert "rung" not in result.stdout
+
+
+def test_supervisor_restart_at_most_once_per_run(run_bootstrap, fake_ha, bootstrap_env):
+    fake_ha.addon_missing("always")
+    result = run_bootstrap()
+    assert result.returncode == 4
+    assert _count(result, "supervisor restart") == 1, result.stdout
+    assert "STILL does not exist after Supervisor restart" in result.stdout
+    assert not Path(bootstrap_env["MARKER"]).exists()
+
+
+def test_store_reload_alone_fixes_it_no_restart(run_bootstrap, fake_ha):
+    # first info call (install check) missing; the re-check after store
+    # reload is present -> rung 2 never reached
+    for _ in range(1):
+        fake_ha.enqueue(
+            "addons info",
+            stdout='{"result":"error","message":"Addon 99f1cad4_ga_manager does not exist"}',
+            code=1,
+        )
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout
+    assert _count(result, "supervisor restart") == 0
+    assert "rung 1" in result.stdout and "rung 2" not in result.stdout

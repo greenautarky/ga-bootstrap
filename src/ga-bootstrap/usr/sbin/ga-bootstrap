@@ -337,9 +337,73 @@ addons_installed() {
   # ha addons info --raw-json reports a "version" KEY for every store-
   # known addon, valued null until the addon is actually installed.
   # Check the VALUE, not just key presence.
-  _v=$("$HA_CLI" addons info "$1" --no-progress --raw-json 2>/dev/null \
-        | "$JQ_CLI" -r '(.data.version // .version // empty)' 2>/dev/null)
+  # The raw reply is kept in $last_addon_info so the caller can tell
+  # "does not exist" (store not loaded) from "known, not installed".
+  last_addon_info=$("$HA_CLI" addons info "$1" --no-progress --raw-json 2>&1 || true)
+  _v=$(printf '%s' "$last_addon_info" \
+        | "$JQ_CLI" -r '(.data.version // .version // empty)' 2>/dev/null || true)
   [ -n "${_v}" ] && [ "${_v}" != "null" ]
+}
+
+last_addon_info=""
+addon_missing_from_store() {
+  # True only when Supervisor says the add-on DOES NOT EXIST (= not in any
+  # loaded store), as opposed to "known but not installed" (version null)
+  # or any other failure. Only this case gets the store-recovery ladder.
+  # Checks the reply of the LAST addons_installed call (no extra API call).
+  printf '%s' "$last_addon_info" | grep -q -i 'does not exist'
+}
+
+wait_supervisor_ready() {
+  _deadline=$(( $(date +%s) + SUPERVISOR_WAIT_S ))
+  while :; do
+    if "$HA_CLI" supervisor info --raw-json 2>/dev/null | grep -q '"result":"ok"'; then
+      return 0
+    fi
+    [ "$(date +%s)" -ge "$_deadline" ] && return 1
+    sleep "$SUPERVISOR_POLL_INTERVAL"
+  done
+}
+
+# Store-recovery ladder (Odoo #1337). Measured on a canary
+# (BOSv1.5.2-rc2, 2026-10-23): a power cut during the first store clone
+# left repository.json zero-length; Supervisor reset + re-cloned the store
+# but never loaded its add-ons into memory — `ha store reload` and
+# `ha addons reload` did not help, `ha supervisor restart` did. So, when
+# the add-on does not exist although the store is registered:
+#   rung 1: store reload, re-check
+#   rung 2: ONE Supervisor restart per run, wait until it answers, re-check
+# then fall through to the normal install retries. Never when the add-on
+# exists (install failing for another reason keeps the old behaviour).
+store_ladder_done=0
+store_recovery_ladder() {
+  store_ladder_done=1
+  if ! addon_repo_present; then
+    log "WARN: $GA_MANAGER_SLUG does not exist AND vibe_addons store is not registered — no store recovery, plain retry"
+    return 0
+  fi
+  log "WARN: $GA_MANAGER_SLUG does not exist although vibe_addons store is registered — rung 1: ha store reload"
+  "$HA_CLI" store reload --no-progress >/dev/null 2>&1 || \
+    log "WARN: rung 1: store reload returned non-zero"
+  addons_installed "$GA_MANAGER_SLUG" || true
+  if ! addon_missing_from_store; then
+    log "WARN: rung 1: $GA_MANAGER_SLUG visible after store reload — continuing install"
+    return 0
+  fi
+  log "WARN: rung 1: $GA_MANAGER_SLUG still does not exist after store reload — rung 2: restarting Supervisor (once per run)"
+  "$HA_CLI" supervisor restart --no-progress >/dev/null 2>&1 || \
+    log "WARN: rung 2: supervisor restart returned non-zero (it may drop the connection) — waiting for it anyway"
+  if wait_supervisor_ready; then
+    log "WARN: rung 2: Supervisor answers again after restart"
+  else
+    log "WARN: rung 2: Supervisor did not answer within ${SUPERVISOR_WAIT_S}s after restart — continuing retries"
+  fi
+  addons_installed "$GA_MANAGER_SLUG" || true
+  if addon_missing_from_store; then
+    log "WARN: rung 2: $GA_MANAGER_SLUG STILL does not exist after Supervisor restart — continuing install retries"
+  else
+    log "WARN: rung 2: $GA_MANAGER_SLUG visible after Supervisor restart — continuing install"
+  fi
 }
 
 log "installing $GA_MANAGER_SLUG — with retry"
@@ -354,6 +418,15 @@ for pre_sleep in $BACKOFF_SEQUENCE; do
     log "$GA_MANAGER_SLUG installed + verified"
     addon_ready=1
     break
+  fi
+  if [ "$store_ladder_done" -eq 0 ] && addon_missing_from_store; then
+    store_recovery_ladder
+    "$HA_CLI" addons install "$GA_MANAGER_SLUG" >/dev/null 2>&1 || true
+    if addons_installed "$GA_MANAGER_SLUG"; then
+      log "$GA_MANAGER_SLUG installed + verified (after store recovery)"
+      addon_ready=1
+      break
+    fi
   fi
   log "addon not yet installed — retrying"
 done
