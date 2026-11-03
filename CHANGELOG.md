@@ -1,3 +1,16 @@
+## 1.2.11 — 2026-11-03
+
+### fix: the restart limit applies again (Odoo #1289)
+
+`StartLimitBurst` / `StartLimitIntervalSec` sat in `[Service]`. Since systemd
+230 they are `[Unit]` settings; systemd 257 logs `Unknown key
+'StartLimitIntervalSec' in section [Service], ignoring` and keeps the default
+10 s window. With `RestartSec=180` the burst of 10 could never be reached, so a
+permanently failing bootstrap retried forever instead of stopping after 10
+attempts in an hour. Moved both keys to `[Unit]`, values unchanged. Measured
+with the unit loaded (not started) on systemd 257: `StartLimitIntervalUSec`
+10s before, 1h after.
+
 ## 1.2.10 — 2026-10-26
 
 ### fix: recover when the GA add-on store is registered but its add-ons never load (Odoo #1337)
