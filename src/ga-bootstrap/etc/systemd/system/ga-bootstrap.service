@@ -5,6 +5,12 @@ After=hassos-supervisor.service network-online.target
 Wants=network-online.target
 Requires=hassos-supervisor.service
 ConditionPathExists=!/mnt/data/.ga-bootstrapped
+# The start limit is a [Unit] setting since systemd 230. In [Service] systemd
+# ignores StartLimitIntervalSec ("Unknown key ... ignoring"), which left the
+# default 10 s window: with RestartSec=180 the burst of 10 could never be
+# reached and the retry loop was unbounded (Odoo #1289).
+StartLimitIntervalSec=3600
+StartLimitBurst=10
 
 [Service]
 Type=oneshot
@@ -36,13 +42,11 @@ SuccessExitStatus=0
 # stops anyway (= Condition gate fires).
 #
 # RestartSec=180 (3 min) balances responsiveness vs storm-avoidance.
-# StartLimitBurst=10 in 3600s (1h) caps the loop — after that operator
+# StartLimitBurst=10 in 3600s (1h, set in [Unit] above) caps the loop — after that operator
 # must intervene so we don't hide a permanent problem behind infinite
 # retries.
 Restart=on-failure
 RestartSec=180
-StartLimitBurst=10
-StartLimitIntervalSec=3600
 
 [Install]
 WantedBy=multi-user.target
