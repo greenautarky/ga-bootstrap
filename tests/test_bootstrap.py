@@ -774,3 +774,38 @@ def test_store_repositories_non_string_source_does_not_crash_or_match(run_bootst
                         stdout='{"result":"ok","data":[{"slug":"x","source":null},{"slug":"y"}]}')
     result = run_bootstrap()
     assert result.returncode == 2, result.stdout + result.stderr
+
+
+def _jq_wrapper(tmp_path, rc: int, msg: str) -> str:
+    w = tmp_path / "jq-broken"
+    w.write_text(f"#!/bin/sh\necho '{msg}' >&2\nexit {rc}\n")
+    w.chmod(0o755)
+    return str(w)
+
+
+@pytest.mark.parametrize("rc", [2, 3, 5])
+def test_jq_program_error_is_loud_and_not_retried(run_bootstrap, tmp_path, bootstrap_env, rc):
+    """A jq compile/runtime error (e.g. image jq without oniguruma, rc 5) used
+    to look like "repo not listed" and loop silently to exit 2 after 6 tries.
+    Now: ERROR with rc + jq's stderr, no 'NOT listed' retry, no 6x store add."""
+    msg = "jq: error: compiled without ONIGURUMA"
+    result = run_bootstrap(JQ_CLI=_jq_wrapper(tmp_path, rc, msg))
+    out = result.stdout + result.stderr
+    assert result.returncode == 2, out
+    assert f"ERROR: jq failed in addon_repo_present (rc={rc})" in out, out
+    assert msg in out, out
+    assert "NOT listed" not in out, out
+    assert sum("store add" in " ".join(c) for c in result.ha_calls) == 1, result.ha_calls
+    assert not Path(bootstrap_env["MARKER"]).exists()
+
+
+def test_ha_failure_in_repo_listing_is_not_masked(run_bootstrap, fake_ha, bootstrap_env):
+    """`ha store repositories` failing must be logged with its rc, not hidden
+    behind the pipe's jq status."""
+    for _ in range(6):
+        fake_ha.enqueue("store add", stdout="ok", code=0)
+        fake_ha.enqueue("store repositories", stdout="", stderr="boom", code=7)
+    result = run_bootstrap()
+    out = result.stdout + result.stderr
+    assert result.returncode == 2, out
+    assert "'ha store repositories' failed (rc=7)" in out, out

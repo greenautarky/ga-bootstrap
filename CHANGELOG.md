@@ -17,6 +17,24 @@ programs (must-fail and must-pass fixtures under `tests/fixtures/jq_lint/`, fail
 on zero programs found), and CI job `test-jq-no-oniguruma` runs the whole suite
 with a jq built `--without-oniguruma`, after proving that jq has no regex.
 
+### fix: jq failures are loud, not "repo not listed" (Odoo #1610 follow-up)
+
+Before: `addon_repo_present` swallowed jq's stderr and exit code, and the caller
+treated every non-zero as "not listed". A jq program error (rc 2/3/5, e.g. a jq
+without oniguruma) therefore retried silently for ~8 min and ended in a generic
+exit 2. A failing `ha` on the left of the pipe was hidden the same way.
+
+After: `ha` and `jq` run as separate steps. `ha` failure logs a WARN with its rc
+(transient, retried). jq rc 0/1/4 = listed / not listed / empty reply. Any other
+jq rc is `ERROR: jq failed in addon_repo_present (rc=N): <stderr>` and bootstrap
+exits 2 at once without retrying (unparseable JSON from `ha` stays a retryable
+WARN). Tests drive the real script with a broken jq (rc 2/3/5) and a failing `ha`.
+
+Lint (`tests/test_jq_lint.py`): the extraction is now a small shell lexer. It
+catches an apostrophe in a jq comment (closes the shell quote early) and no
+longer takes a `--arg` value as the program; comment lines mentioning "jq" are not
+programs; the live script's program count is a pinned constant (8).
+
 ## 1.2.12 — 2026-11-09
 
 ### fix: a re-run no longer loops on Supervisor 2026.10's store 409, and step 3a always gets reached (Odoo #1610)

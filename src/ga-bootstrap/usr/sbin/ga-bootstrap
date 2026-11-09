@@ -158,6 +158,15 @@ fi
 # BOSv1.2.4 — proven against transient supervisor-git-clone races in the
 # field. The build-test BS-RETRY-01/02 enforces both exist.
 
+# Return codes (never conflate them — a jq PROGRAM error used to look exactly
+# like "not present" and made bootstrap retry-loop silently, Odoo #1610):
+#   0 repo is listed        1 repo is not listed (retryable)
+#   2 ERROR: jq failed (compile/runtime/usage rc 2/3/5, or any other
+#     unexpected rc) — logged at error level with rc + jq's stderr; the
+#     caller must NOT retry, a retry cannot fix a broken jq/program.
+# A failing `ha` is logged (WARN, with its rc) and counts as "not listed":
+# that one is transient. There is no pipefail, so ha and jq run as separate
+# steps; `ha ... | jq` would hide ha's exit status.
 addon_repo_present() {
   # ha store repositories --raw-json lists configured repos under .data
   # (an object with .repositories, or - as the Supervisor API returns it - a
@@ -165,8 +174,14 @@ addon_repo_present() {
   # slashes and a trailing ".git" are ignored (Odoo #1610 round 2).
   # shellcheck disable=SC2016  # $url is a JQ variable bound by --arg, not a
   # shell variable — single quotes are required, not a mistake.
-  "$HA_CLI" store repositories --no-progress --raw-json 2>/dev/null \
-    | "$JQ_CLI" -e --arg url "$VIBE_STORE_URL" '
+  local repos jq_err jq_rc ha_rc=0
+  repos=$("$HA_CLI" store repositories --no-progress --raw-json 2>/dev/null) || ha_rc=$?
+  if [ "$ha_rc" -ne 0 ]; then
+    log "WARN: 'ha store repositories' failed (rc=$ha_rc) — treating the repo as not listed"
+    return 1
+  fi
+  jq_err=$(mktemp -t ga-bootstrap-jq.XXXXXX)
+  printf '%s' "$repos" | "$JQ_CLI" -e --arg url "$VIBE_STORE_URL" '
         # NO regex builtins here (sub/test/match/capture/scan/gsub/splits):
         # the shipped jq is built WITHOUT oniguruma, so any of them exits 5
         # and this function would never return true (rc7 gate, Odoo #1610).
@@ -184,7 +199,20 @@ addon_repo_present() {
         (.data.repositories? // .repositories? // .data? // [])
         | map((.source? // "") | if type == "string" then norm else "" end)
         | any(. == ($url | norm))
-      ' >/dev/null 2>&1
+      ' >/dev/null 2>"$jq_err" && jq_rc=0 || jq_rc=$?
+  jq_msg=$(cat "$jq_err" 2>/dev/null || true)
+  rm -f "$jq_err"
+  case "$jq_rc" in
+    0) return 0 ;;
+    1|4) return 1 ;;   # false/null, or no output (empty ha reply): not listed
+    *)
+      if [ "$jq_rc" -eq 2 ] && printf '%s' "$jq_msg" | grep -qi 'parse error'; then
+        log "WARN: 'ha store repositories' returned unparseable JSON (jq rc=2): $jq_msg — treating the repo as not listed"
+        return 1
+      fi
+      log "ERROR: jq failed in addon_repo_present (rc=$jq_rc): $jq_msg"
+      return 2 ;;
+  esac
 }
 
 log "adding vibe_addons store ($VIBE_STORE_URL) — with retry"
@@ -211,7 +239,12 @@ for pre_sleep in $BACKOFF_SEQUENCE; do
   # HTTP 409 whose CLI text no longer contains "already" (measured on a
   # canary, Odoo #1610), so the old grep looped forever and never reached
   # step 3a. A 409 counts as "registered" ONLY if the repo is listed.
-  if addon_repo_present; then
+  present_rc=0
+  addon_repo_present || present_rc=$?
+  if [ "$present_rc" -eq 2 ]; then
+    fail "jq error while checking the store list (see ERROR above) — not retrying" 2
+  fi
+  if [ "$present_rc" -eq 0 ]; then
     if [ "$rc" -ne 0 ]; then
       log "store add returned $rc but the repo is listed — store already registered"
     fi
@@ -247,7 +280,13 @@ for pre_sleep in $BACKOFF_SEQUENCE; do
     printf '%s' "$store_output" | head -2 | while IFS= read -r l; do log "  supervisor: $l"; done
     if "$HA_CLI" jobs options --ignore-conditions supervisor_updated --no-progress >/dev/null 2>&1; then
       log "lifted supervisor_updated condition — retrying store add immediately"
-      if "$HA_CLI" --no-progress store add "$VIBE_STORE_URL" >/dev/null 2>&1 && addon_repo_present; then
+      present_rc=1
+      if "$HA_CLI" --no-progress store add "$VIBE_STORE_URL" >/dev/null 2>&1; then
+        present_rc=0
+        addon_repo_present || present_rc=$?
+        [ "$present_rc" -ne 2 ] || fail "jq error while checking the store list (see ERROR above) — not retrying" 2
+      fi
+      if [ "$present_rc" -eq 0 ]; then
         log "vibe_addons store registered + verified (after lifting the condition)"
         store_added=1
         "$HA_CLI" store reload --no-progress >/dev/null 2>&1 || true
