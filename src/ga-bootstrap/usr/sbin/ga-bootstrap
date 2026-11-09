@@ -167,9 +167,20 @@ addon_repo_present() {
   # shell variable — single quotes are required, not a mistake.
   "$HA_CLI" store repositories --no-progress --raw-json 2>/dev/null \
     | "$JQ_CLI" -e --arg url "$VIBE_STORE_URL" '
-        def norm: ascii_downcase
-                  | sub("^[a-z][a-z0-9+.-]*://"; "")
-                  | sub("/+$"; "") | sub("\\.git$"; "") | sub("/+$"; "");
+        # NO regex builtins here (sub/test/match/capture/scan/gsub/splits):
+        # the shipped jq is built WITHOUT oniguruma, so any of them exits 5
+        # and this function would never return true (rc7 gate, Odoo #1610).
+        # tests/test_jq_lint.py enforces it; CI also runs pytest with such a jq.
+        def scheme_ok: length > 0
+                       and (.[0] | . >= 97 and . <= 122)
+                       and all(.[1:][]; (. >= 97 and . <= 122) or (. >= 48 and . <= 57)
+                                        or . == 43 or . == 45 or . == 46);
+        def strip_scheme: split("://") as $p
+                  | if ($p | length) > 1 and ($p[0] | explode | scheme_ok)
+                    then ($p[1:] | join("://")) else . end;
+        def rtrim_slash: until(endswith("/") | not; .[:-1]);
+        def norm: ascii_downcase | strip_scheme | rtrim_slash
+                  | if endswith(".git") then .[:-4] else . end | rtrim_slash;
         (.data.repositories? // .repositories? // .data? // [])
         | map((.source? // "") | if type == "string" then norm else "" end)
         | any(. == ($url | norm))

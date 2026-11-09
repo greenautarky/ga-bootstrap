@@ -38,6 +38,39 @@ jobs:
       - name: Pytest
         run: pytest tests/ -v
 
+  test-jq-no-oniguruma:
+    # The iHost image ships jq built WITHOUT oniguruma (BR2_PACKAGE_JQ=y, no
+    # BR2_PACKAGE_ONIGURUMA): every regex builtin (test/match/capture/scan/sub/
+    # gsub/splits, split/2) exits 5 on the device. Runner jq has them, so the
+    # normal test job cannot see that class (rc7 K31 gate, 2026-11-09). Run the
+    # whole suite against a jq built the way the image builds it.
+    runs-on: ubuntu-latest
+    env:
+      JQ_VERSION: "1.7.1"
+      JQ_SHA256: "478c9ca129fd2e3443fe27314b455e211e0d8c60bc8ff7df703873deeee580c2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Build jq without oniguruma
+        run: |
+          curl -fsSL -o /tmp/jq.tgz "https://github.com/jqlang/jq/releases/download/jq-${JQ_VERSION}/jq-${JQ_VERSION}.tar.gz"
+          echo "${JQ_SHA256}  /tmp/jq.tgz" | sha256sum -c -
+          tar -xzf /tmp/jq.tgz -C /tmp
+          cd "/tmp/jq-${JQ_VERSION}"
+          # gcc 15 defaults to C23, which jq 1.7.1 does not compile under
+          CFLAGS="-O2 -std=gnu17" ./configure --without-oniguruma --disable-docs --disable-maintainer-mode --prefix=/opt/jq-nooni
+          make -j"$(nproc)"
+          sudo make install
+      - name: Install
+        run: pip install -e .[dev]
+      - name: Pytest with the no-oniguruma jq (fixture proves it has no regex)
+        env:
+          JQ_CLI: /opt/jq-nooni/bin/jq
+          GA_REQUIRE_NO_ONIGURUMA: "1"
+        run: pytest tests/ -v
+
   systemd-unit-check:
     # Sanity: the .service file is consumed by systemd at boot, so a
     # parse error means a brick. systemd-analyze verify is cheap and
