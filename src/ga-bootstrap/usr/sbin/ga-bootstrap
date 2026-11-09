@@ -71,6 +71,10 @@ HA_CORE_POLL_INTERVAL="${HA_CORE_POLL_INTERVAL:-10}"
 GA_MANAGER_SLUG="${GA_MANAGER_SLUG:-99f1cad4_ga_manager}"
 VIBE_STORE_URL="${VIBE_STORE_URL:-https://github.com/greenautarky/vibe_addons}"
 GHCR_CREDS_FILE="${GHCR_CREDS_FILE:-/etc/ga/ghcr-creds.json}"
+# Host-side add-on data roots. Supervisor 2026.10 renamed
+# /mnt/data/supervisor/addons to .../apps; older Supervisors use addons.
+# Both are searched, apps first (Odoo #1610).
+SUPERVISOR_DATA_ROOTS="${SUPERVISOR_DATA_ROOTS:-/mnt/data/supervisor/apps/data /mnt/data/supervisor/addons/data}"
 HA_CLI="${HA_CLI:-ha}"
 JQ_CLI="${JQ_CLI:-jq}"
 DRY_RUN="${BG_DRY_RUN:-0}"
@@ -186,13 +190,20 @@ for pre_sleep in $BACKOFF_SEQUENCE; do
   # never fired and ga-bootstrap retried forever on a re-bootstrap.
   store_output=$(cat "$store_log" 2>/dev/null || true)
   rm -f "$store_log"
-  if [ "$rc" -eq 0 ] || printf '%s' "$store_output" | grep -q -i 'already'; then
-    if addon_repo_present; then
-      log "vibe_addons store registered + verified"
-      store_added=1
-      "$HA_CLI" store reload --no-progress >/dev/null 2>&1 || true
-      break
+  # Decide by "repo present" (the store list), never by the wording of the
+  # reply: Supervisor 2026.10 answers a re-add of a registered store with
+  # HTTP 409 whose CLI text no longer contains "already" (measured on a
+  # canary, Odoo #1610), so the old grep looped forever and never reached
+  # step 3a. A 409 counts as "registered" ONLY if the repo is listed.
+  if addon_repo_present; then
+    if [ "$rc" -ne 0 ]; then
+      log "store add returned $rc but the repo is listed — store already registered"
     fi
+    log "vibe_addons store registered + verified"
+    store_added=1
+    "$HA_CLI" store reload --no-progress >/dev/null 2>&1 || true
+    break
+  elif [ "$rc" -eq 0 ]; then
     log "store add returned ok but repo not yet visible — retrying"
   elif printf '%s' "$store_output" | grep -q -i 'blocked from execution'; then
     # NOT a transient race — a Supervisor JOB CONDITION, and retrying it for
@@ -231,7 +242,7 @@ for pre_sleep in $BACKOFF_SEQUENCE; do
       log "WARN: could not lift the job condition — the store will stay blocked"
     fi
   else
-    log "store add returned $rc (likely transient supervisor-git race) — retrying"
+    log "WARN: store add returned $rc and the repo is NOT listed — unexpected, retrying: $(printf '%s' "$store_output" | head -1)"
   fi
 done
 [ "$store_added" -eq 1 ] || fail "vibe_addons store failed to register after 6 attempts (~8 min)" 2
@@ -242,7 +253,7 @@ done
 #
 #   1. $GHCR_CREDS_FILE (env / EnvironmentFile override) — explicit operator path
 #   2. /etc/ga/ghcr-creds.json — OS-bake-time path (= original v1.2.x convention)
-#   3. /mnt/data/supervisor/addons/data/*_ga_manager/ghcr-creds.json — glob over
+#   3. /mnt/data/supervisor/{apps,addons}/data/*_ga_manager/ghcr-creds.json — glob over
 #      ga_manager's addon-private dir, where ga_manager 0.27.1+ writes via
 #      its /data/ mount. The wildcard before "_ga_manager" tolerates slug
 #      renames (= today 99f1cad4_ga_manager, but a slug bump wouldn't
@@ -279,11 +290,13 @@ done
 # The slug pattern *_ga_manager covers today's 99f1cad4_ga_manager and
 # any future re-build of the addon under a different installation slug.
 if [ -z "$GHCR_CREDS_FILE_FOUND" ]; then
-  for candidate in /mnt/data/supervisor/addons/data/*_ga_manager/ghcr-creds.json; do
-    if [ -f "$candidate" ]; then
-      GHCR_CREDS_FILE_FOUND="$candidate"
-      break
-    fi
+  for _root in $SUPERVISOR_DATA_ROOTS; do
+    for candidate in "$_root"/*_ga_manager/ghcr-creds.json; do
+      if [ -f "$candidate" ]; then
+        GHCR_CREDS_FILE_FOUND="$candidate"
+        break 2
+      fi
+    done
   done
 fi
 if [ -z "$GHCR_CREDS_FILE_FOUND" ]; then
@@ -457,18 +470,27 @@ fi
 #
 # Best-effort: if the API call fails, log + continue. The addon will run
 # but its self-update path will be broken until an operator fixes it.
-log "disabling protected mode on $GA_MANAGER_SLUG (= enables docker_api self-update path)"
-if docker exec hassio_cli sh -c 'wget -qO- \
-    --header="Authorization: Bearer $SUPERVISOR_TOKEN" \
-    --header="Content-Type: application/json" \
-    --post-data="{\"protected\": false}" \
-    "http://supervisor/addons/'"$GA_MANAGER_SLUG"'/security"' \
-    2>/dev/null | grep -q '"result":"ok"'; then
-  log "protected=false applied — restarting $GA_MANAGER_SLUG to pick up correct binds"
-  "$HA_CLI" addons restart "$GA_MANAGER_SLUG" >/dev/null 2>&1 || \
-    log "WARN: restart after protected=false toggle failed — addon will pick up on next manual restart"
+# Idempotent: if Supervisor already reports protected=false (an earlier run
+# got this far) there is nothing to flip and no reason to restart again.
+# Unknown (no/unparseable answer) is treated as "still protected" and flips.
+_prot=$("$HA_CLI" addons info "$GA_MANAGER_SLUG" --no-progress --raw-json 2>/dev/null \
+        | "$JQ_CLI" -r '(if .data.protected != null then .data.protected else .protected end | if . == null then "unknown" else tostring end)' 2>/dev/null || true)
+if [ "$_prot" = "false" ]; then
+  log "$GA_MANAGER_SLUG already has protected=false — step 3a not needed (ga_manager restarts itself if the docker.sock is missing)"
 else
-  log "WARN: could not disable protected mode on $GA_MANAGER_SLUG — fleet-manager-dispatched addon-update jobs will fail until an operator fixes this manually (see ha-operating-system memory:bug_k49_supervisor_docker_sock_missing_2026_06_21)"
+  log "disabling protected mode on $GA_MANAGER_SLUG (= enables docker_api self-update path)"
+  if docker exec hassio_cli sh -c 'wget -qO- \
+      --header="Authorization: Bearer $SUPERVISOR_TOKEN" \
+      --header="Content-Type: application/json" \
+      --post-data="{\"protected\": false}" \
+      "http://supervisor/addons/'"$GA_MANAGER_SLUG"'/security"' \
+      2>/dev/null | grep -q '"result":"ok"'; then
+    log "protected=false applied — restarting $GA_MANAGER_SLUG to pick up correct binds"
+    "$HA_CLI" addons restart "$GA_MANAGER_SLUG" >/dev/null 2>&1 || \
+      log "WARN: restart after protected=false toggle failed — addon will pick up on next manual restart"
+  else
+    log "WARN: could not disable protected mode on $GA_MANAGER_SLUG — fleet-manager-dispatched addon-update jobs will fail until an operator fixes this manually (see ha-operating-system memory:bug_k49_supervisor_docker_sock_missing_2026_06_21)"
+  fi
 fi
 
 # --- 4a. wait for HA Core ready ---------------------------------------

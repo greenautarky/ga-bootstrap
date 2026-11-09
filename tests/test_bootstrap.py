@@ -442,6 +442,11 @@ def test_blocked_job_condition_is_lifted_not_retried(run_bootstrap, fake_ha, boo
                "supervisor needs to be updated first",
         code=1,
     )
+    fake_ha.enqueue(
+        "store repositories",
+        stdout='{"result":"ok","data":{"repositories":[]}}',
+        code=0,
+    )
     # After lifting the condition the retry succeeds and the repo shows up.
     result = run_bootstrap()
 
@@ -463,6 +468,11 @@ def test_the_lift_is_not_supervisor_update(run_bootstrap, fake_ha):
         stdout="Error: 'StoreManager.add_repository' blocked from execution, "
                "supervisor needs to be updated first",
         code=1,
+    )
+    fake_ha.enqueue(
+        "store repositories",
+        stdout='{"result":"ok","data":{"repositories":[]}}',
+        code=0,
     )
     result = run_bootstrap()
     assert not any(
@@ -538,3 +548,108 @@ def test_store_reload_alone_fixes_it_no_restart(run_bootstrap, fake_ha):
     assert result.returncode == 0, result.stdout
     assert _count(result, "supervisor restart") == 0
     assert "rung 1" in result.stdout and "rung 2" not in result.stdout
+
+
+# --- Supervisor 2026.10: re-adding a registered store answers 409 (Odoo #1610)
+# The CLI text is "Error: unexpected server response (status: 409)" and no
+# longer contains "already". The old grep looped forever and never reached 3a.
+
+_E409 = "Error: unexpected server response (status: 409)"
+
+
+def _security_posts(result):
+    return [c for c in result.docker_calls
+            if any("/security" in a and "protected" in a for a in c)]
+
+
+def test_store_add_409_without_already_does_not_loop_and_runs_3a(
+    run_bootstrap, fake_ha, bootstrap_env,
+):
+    # Repo IS listed (fake default); only the 409 wording differs.
+    fake_ha.enqueue("store add", stdout=_E409, code=1)
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert Path(bootstrap_env["MARKER"]).is_file()
+    assert _count(result, "store add") == 1, "must not retry a registered store"
+    assert _security_posts(result), "step 3a (protected=false) must run"
+    assert any(c[:2] == ["addons", "restart"] for c in result.ha_calls)
+
+
+def test_store_add_409_with_repo_absent_is_not_treated_as_registered(
+    run_bootstrap, fake_ha, bootstrap_env,
+):
+    for _ in range(6):
+        fake_ha.enqueue("store add", stdout=_E409, code=1)
+        fake_ha.enqueue(
+            "store repositories",
+            stdout='{"result":"ok","data":{"repositories":[]}}', code=0,
+        )
+    result = run_bootstrap()
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert not Path(bootstrap_env["MARKER"]).exists()
+
+
+def test_repo_absent_store_add_is_called_until_listed(run_bootstrap, fake_ha, bootstrap_env):
+    fake_ha.enqueue("store add", stdout="Store added", code=0)
+    fake_ha.enqueue(
+        "store repositories",
+        stdout='{"result":"ok","data":{"repositories":[]}}', code=0,
+    )
+    result = run_bootstrap()  # 2nd store add + default (listed) repos
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _count(result, "store add") == 2
+
+
+def test_unexpected_store_add_error_is_loud(run_bootstrap, fake_ha, bootstrap_env):
+    for _ in range(6):
+        fake_ha.enqueue("store add", stdout="Error: kaboom (status: 500)", code=1)
+        fake_ha.enqueue(
+            "store repositories",
+            stdout='{"result":"ok","data":{"repositories":[]}}', code=0,
+        )
+    result = run_bootstrap()
+    assert result.returncode == 2
+    out = result.stdout + result.stderr
+    assert "WARN: store add returned 1 and the repo is NOT listed" in out
+    assert "kaboom" in out
+
+
+def test_3a_is_idempotent_when_already_unprotected(run_bootstrap, fake_ha, bootstrap_env):
+    # 3a only queries once step 4 passed: install check, then 3a's own query.
+    fake_ha.enqueue("addons info", stdout='{"result":"ok","data":{"version":"0.27.0"}}')
+    fake_ha.enqueue(
+        "addons info",
+        stdout='{"result":"ok","data":{"version":"0.27.0","protected":false}}',
+    )
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not _security_posts(result)
+    assert not any(c[:2] == ["addons", "restart"] for c in result.ha_calls)
+    assert "already has protected=false" in result.stdout + result.stderr
+
+
+def test_3a_runs_when_protected_true(run_bootstrap, fake_ha, bootstrap_env):
+    fake_ha.enqueue("addons info", stdout='{"result":"ok","data":{"version":"0.27.0"}}')
+    fake_ha.enqueue(
+        "addons info",
+        stdout='{"result":"ok","data":{"version":"0.27.0","protected":true}}',
+    )
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _security_posts(result)
+    assert any(c[:2] == ["addons", "restart"] for c in result.ha_calls)
+
+
+def test_creds_found_under_supervisor_2026_10_apps_root(run_bootstrap, tmp_path, bootstrap_env):
+    """Supervisor 2026.10 renamed the host data root addons/ -> apps/."""
+    import json
+    d = tmp_path / "sup" / "apps" / "data" / "99f1cad4_ga_manager"
+    d.mkdir(parents=True)
+    (d / "ghcr-creds.json").write_text(json.dumps({"ghcr.io": {"username": "u", "password": "p"}}))
+    result = run_bootstrap(
+        GHCR_CREDS_FILE=str(tmp_path / "missing.json"),
+        SUPERVISOR_DATA_ROOTS=f"{tmp_path}/sup/apps/data {tmp_path}/sup/addons/data",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "found via fallback" in result.stdout + result.stderr
+    assert "/sup/apps/data/" in result.stdout + result.stderr
