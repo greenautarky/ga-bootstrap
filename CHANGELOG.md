@@ -25,15 +25,24 @@ without oniguruma) therefore retried silently for ~8 min and ended in a generic
 exit 2. A failing `ha` on the left of the pipe was hidden the same way.
 
 After: `ha` and `jq` run as separate steps. `ha` failure logs a WARN with its rc
-(transient, retried). jq rc 0/1/4 = listed / not listed / empty reply. Any other
-jq rc is `ERROR: jq failed in addon_repo_present (rc=N): <stderr>` and bootstrap
-exits 2 at once without retrying (unparseable JSON from `ha` stays a retryable
-WARN). Tests drive the real script with a broken jq (rc 2/3/5) and a failing `ha`.
+(transient, retried). The reply is first parse-checked by its own `jq -e 'type'`
+call: HTML/502, truncated JSON, text or an empty reply (jq 1.7 answers rc 5 for
+these, same as a program error) is a retryable WARN. The real program is total
+over JSON types, so valid JSON of an unexpected shape (data as string, top-level
+array/number, ...) is also a retryable WARN, and a top-level array is read as the
+repo list. Only a failure of the program itself, jq not runnable (126/127) or a
+failed mktemp is `ERROR: jq failed in addon_repo_present (rc=N): <stderr>`, and
+bootstrap exits with the NEW code **5** at once without retrying (2 stays "store
+did not register after all retries"). Tests: stub jq for the program-error path,
+the REAL jq (CI also the no-oniguruma 1.7.1) for every transient reply shape.
 
 Lint (`tests/test_jq_lint.py`): the extraction is now a small shell lexer. It
 catches an apostrophe in a jq comment (closes the shell quote early) and no
 longer takes a `--arg` value as the program; comment lines mentioning "jq" are not
-programs; the live script's program count is a pinned constant (8).
+programs; the live script's program count is a pinned constant (9). Command
+position now includes if/while/until/!/env/then/do/&&/||, double-quoted programs
+are linted, and any jq token the lexer cannot attribute to a linted program
+(-f file, variable program, not at command position) is itself a lint failure.
 
 ## 1.2.12 — 2026-11-09
 

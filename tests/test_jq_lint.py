@@ -22,9 +22,9 @@ _OPT_ARGS = {"--arg": 2, "--argjson": 2, "--slurpfile": 2, "--rawfile": 2,
              "--indent": 1, "-L": 1, "--seq": 0}
 _FROM_FILE = {"-f", "--from-file"}
 # pinned: real jq programs in the live script (addon_repo_present, step 1a,
-# creds host list + username + password, version, protected, state).
+# parse check, creds host list + username + password, version, protected, state).
 # Update deliberately when a jq call is added or removed.
-EXPECTED_LIVE_PROGRAMS = 8
+EXPECTED_LIVE_PROGRAMS = 9
 TRUNCATED = "<<shell-quote-truncated-program>>"
 
 
@@ -83,20 +83,34 @@ def _is_jq(segs) -> bool:
     return plain in ("jq", "$JQ_CLI", "${JQ_CLI}")
 
 
+_CMD_PREFIX = {"if", "while", "until", "!", "env", "then", "do", "elif", "else", "time", "exec"}
+UNLINTED = "<<jq-call-the-lint-cannot-attribute-to-a-program>>"
+
+
 def jq_programs(text: str) -> list[str]:
-    """Program text of each real jq invocation (command position only; words
-    in comments/strings that merely say "jq" are not programs). A program
-    whose shell quote is closed early (apostrophe in a jq comment) is
-    returned with a TRUNCATED marker so the lint fails it."""
+    """Program text of each jq invocation. Command position = start of a
+    command, after an operator (| ; & && || $( newline) or after
+    if/while/until/!/env/then/do/... Programs may be single- or double-quoted.
+    A program whose shell quote is closed early (apostrophe in a jq comment)
+    gets a TRUNCATED marker. ANY other jq token (not at command position, -f
+    file, unquoted/variable program, no program) yields an UNLINTED marker, so
+    an unlinted jq call is red, never silently uncounted. Words in comments
+    are not tokens at all."""
     toks = list(_lex(text))
     progs = []
-    prev_op = True
+    cmd_pos = True
     k = 0
     while k < len(toks):
         kind, val = toks[k]
-        if kind == "word" and prev_op and _is_jq(val):
+        if kind == "word" and _is_jq(val):
+            if not cmd_pos:
+                progs.append(UNLINTED)
+                cmd_pos = False
+                k += 1
+                continue
             k += 1
             skip = 0
+            found = False
             while k < len(toks) and toks[k][0] == "word":
                 segs = toks[k][1]
                 word = "".join(t for _, t in segs)
@@ -107,21 +121,30 @@ def jq_programs(text: str) -> list[str]:
                 elif word.startswith("-") and len(segs) == 1 and segs[0][0] == "u":
                     skip = _OPT_ARGS.get(word, 0)
                 else:
-                    if segs[0][0] == "s":
+                    if segs[0][0] in ("s", "d") and not (
+                            len(segs) == 1 and segs[0][0] == "d"
+                            and re.fullmatch(r"\$\{?\w+\}?", segs[0][1])):
                         prog = segs[0][1]
                         if len(segs) > 1 and segs[1][0] == "u" and segs[1][1][:1].isalnum():
                             prog += TRUNCATED
                         progs.append(prog)
+                        found = True
                     break
                 k += 1
+            if not found:
+                progs.append(UNLINTED)
+            cmd_pos = False
             continue
-        prev_op = kind == "op"
+        cmd_pos = kind == "op" or (
+            kind == "word" and len(val) == 1 and val[0][0] == "u" and val[0][1] in _CMD_PREFIX)
         k += 1
     return progs
 
 
 def violations(prog: str) -> list[str]:
     # drop jq comments (a '#' at line start or after whitespace)
+    if prog == UNLINTED:
+        return ["jq call the lint cannot attribute to a program (unlinted jq is red)"]
     if TRUNCATED in prog:
         return ["apostrophe closed the shell quote early (jq comment?)"]
     stripped = re.sub(r'(^|\s)#[^\n]*', r'\1', prog)
@@ -163,8 +186,24 @@ def test_fixture_sets_are_not_empty():
 
 
 def test_comment_mentions_of_jq_are_not_programs():
-    assert jq_programs("# jq 'sub(x)' is bad\necho jq 'sub(x)'\n") == []
+    assert jq_programs("# jq 'sub(x)' is bad\necho \"jq 'sub(x)'\"\n") == []
 
 
 def test_arg_value_is_not_taken_as_program():
     assert jq_programs("jq -e --arg a 'x' '.b'\n") == [".b"]
+
+
+@pytest.mark.parametrize("text", [
+    "if jq -e 'sub(1;2)' f; then :; fi\n",
+    "while ! jq -e 'test(\"a\")' f; do :; done\n",
+    "x=1 && jq -e 'scan(\"a\")' f\n",
+    "env jq -e 'gsub(\"a\";\"b\")' f\n",
+    'jq -e "sub(\\"a\\";\\"b\\")" f\n',
+    'jq -f prog.jq in.json\n',
+    'jq -e "$PROG" in.json\n',
+    'xargs jq -e \'.a\'\n',
+])
+def test_inline_shapes_are_flagged(text):
+    progs = jq_programs(text)
+    assert progs, text
+    assert [v for p in progs for v in violations(p)], (text, progs)
