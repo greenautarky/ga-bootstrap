@@ -9,7 +9,10 @@ sandbox env, then asserts on:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+import pytest
 
 
 def _called(result, verb_prefix: str) -> bool:
@@ -442,6 +445,11 @@ def test_blocked_job_condition_is_lifted_not_retried(run_bootstrap, fake_ha, boo
                "supervisor needs to be updated first",
         code=1,
     )
+    fake_ha.enqueue(
+        "store repositories",
+        stdout='{"result":"ok","data":{"repositories":[]}}',
+        code=0,
+    )
     # After lifting the condition the retry succeeds and the repo shows up.
     result = run_bootstrap()
 
@@ -463,6 +471,11 @@ def test_the_lift_is_not_supervisor_update(run_bootstrap, fake_ha):
         stdout="Error: 'StoreManager.add_repository' blocked from execution, "
                "supervisor needs to be updated first",
         code=1,
+    )
+    fake_ha.enqueue(
+        "store repositories",
+        stdout='{"result":"ok","data":{"repositories":[]}}',
+        code=0,
     )
     result = run_bootstrap()
     assert not any(
@@ -538,3 +551,204 @@ def test_store_reload_alone_fixes_it_no_restart(run_bootstrap, fake_ha):
     assert result.returncode == 0, result.stdout
     assert _count(result, "supervisor restart") == 0
     assert "rung 1" in result.stdout and "rung 2" not in result.stdout
+
+
+# --- Supervisor 2026.10: re-adding a registered store answers 409 (Odoo #1610)
+# The CLI text is "Error: unexpected server response (status: 409)" and no
+# longer contains "already". The old grep looped forever and never reached 3a.
+
+_E409 = "Error: unexpected server response (status: 409)"
+
+
+def _security_posts(result):
+    return [c for c in result.docker_calls
+            if any("/security" in a and "protected" in a for a in c)]
+
+
+def test_store_add_409_without_already_does_not_loop_and_runs_3a(
+    run_bootstrap, fake_ha, bootstrap_env,
+):
+    # Repo IS listed (fake default); only the 409 wording differs.
+    fake_ha.enqueue("store add", stdout=_E409, code=1)
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert Path(bootstrap_env["MARKER"]).is_file()
+    assert _count(result, "store add") == 1, "must not retry a registered store"
+    assert _security_posts(result), "step 3a (protected=false) must run"
+    assert any(c[:2] == ["addons", "restart"] for c in result.ha_calls)
+
+
+def test_store_add_409_with_repo_absent_is_not_treated_as_registered(
+    run_bootstrap, fake_ha, bootstrap_env,
+):
+    for _ in range(6):
+        fake_ha.enqueue("store add", stdout=_E409, code=1)
+        fake_ha.enqueue(
+            "store repositories",
+            stdout='{"result":"ok","data":{"repositories":[]}}', code=0,
+        )
+    result = run_bootstrap()
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert not Path(bootstrap_env["MARKER"]).exists()
+
+
+def test_repo_absent_store_add_is_called_until_listed(run_bootstrap, fake_ha, bootstrap_env):
+    fake_ha.enqueue("store add", stdout="Store added", code=0)
+    fake_ha.enqueue(
+        "store repositories",
+        stdout='{"result":"ok","data":{"repositories":[]}}', code=0,
+    )
+    result = run_bootstrap()  # 2nd store add + default (listed) repos
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _count(result, "store add") == 2
+
+
+def test_unexpected_store_add_error_is_loud(run_bootstrap, fake_ha, bootstrap_env):
+    for _ in range(6):
+        fake_ha.enqueue("store add", stdout="Error: kaboom (status: 500)", code=1)
+        fake_ha.enqueue(
+            "store repositories",
+            stdout='{"result":"ok","data":{"repositories":[]}}', code=0,
+        )
+    result = run_bootstrap()
+    assert result.returncode == 2
+    out = result.stdout + result.stderr
+    assert "WARN: store add returned 1 and the repo is NOT listed" in out
+    assert "kaboom" in out
+
+
+_INSPECT = "inspect addon_99f1cad4_ga_manager"
+_MOUNTS_NO_SOCK = "/data\n/config\n/share\n"
+_MOUNTS_SOCK = "/data\n/config\n/run/docker.sock\n"
+
+
+def _repos(sources):
+    return json.dumps({"result": "ok", "data": {"repositories": [{"source": x} for x in sources]}})
+
+
+def _gm_restarts(result):
+    return [c for c in result.ha_calls if c[:3] == ["addons", "restart", "99f1cad4_ga_manager"]]
+
+
+def _enqueue_info(fake_ha, protected):
+    # 3a only queries once step 4 passed: install check, then 3a's own query.
+    fake_ha.enqueue("addons info", stdout='{"result":"ok","data":{"version":"0.27.0"}}')
+    fake_ha.enqueue(
+        "addons info",
+        stdout=json.dumps({"result": "ok", "data": {"version": "0.27.0", "protected": protected}}),
+    )
+
+
+def test_3a_protected_false_and_socket_bound_is_skipped(run_bootstrap, fake_ha, fake_docker):
+    _enqueue_info(fake_ha, False)
+    fake_docker.enqueue(_INSPECT, stdout=_MOUNTS_SOCK)
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not _security_posts(result)
+    assert not _gm_restarts(result)
+    assert "docker.sock is bound" in result.stdout + result.stderr
+
+
+def test_3a_protected_false_but_socket_absent_restarts_once(run_bootstrap, fake_ha, fake_docker):
+    """The rc6 end state: flag already false, container never recreated."""
+    _enqueue_info(fake_ha, False)
+    fake_docker.enqueue(_INSPECT, stdout=_MOUNTS_NO_SOCK)
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(_gm_restarts(result)) == 1
+    assert not _security_posts(result), "flag is already false: no second flip"
+    assert "NO docker.sock bound" in result.stdout + result.stderr
+
+
+def test_3a_protected_false_old_style_var_run_socket_counts_as_bound(
+        run_bootstrap, fake_ha, fake_docker):
+    _enqueue_info(fake_ha, False)
+    fake_docker.enqueue(_INSPECT, stdout="/data\n/var/run/docker.sock\n")
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not _gm_restarts(result)
+
+
+def test_3a_protected_false_uninspectable_container_does_not_restart_but_warns(
+        run_bootstrap, fake_ha, fake_docker):
+    _enqueue_info(fake_ha, False)
+    fake_docker.enqueue(_INSPECT, stderr="Error: No such object", code=1)
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not _gm_restarts(result)
+    assert "cannot inspect" in result.stdout + result.stderr
+
+
+def test_3a_runs_when_protected_true(run_bootstrap, fake_ha, bootstrap_env):
+    _enqueue_info(fake_ha, True)
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _security_posts(result)
+    assert len(_gm_restarts(result)) == 1, "flip + exactly one restart"
+
+
+# Store source matching: case, scheme, trailing slash and ".git" are ignored.
+
+@pytest.mark.parametrize("listed", [
+    "https://example.invalid/vibe_addons/",
+    "https://example.invalid/vibe_addons.git",
+    "https://example.invalid/vibe_addons.git/",
+    "http://example.invalid/vibe_addons",
+    "HTTPS://Example.Invalid/Vibe_Addons",
+    "git+https://example.invalid/vibe_addons.git",
+])
+def test_store_source_match_is_normalised(run_bootstrap, fake_ha, listed):
+    fake_ha.enqueue("store add", stdout=_E409, code=1)
+    fake_ha.enqueue(
+        "store repositories",
+        stdout=_repos([listed]),
+    )
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _count(result, "store add") == 1, f"{listed!r} must count as registered"
+
+
+@pytest.mark.parametrize("listed", [
+    "https://example.invalid/vibe_addons_other",
+    "https://other.invalid/vibe_addons",
+    "https://example.invalid/vibe_addons/sub",
+])
+def test_store_source_match_does_not_overmatch(run_bootstrap, fake_ha, listed):
+    for _ in range(6):
+        fake_ha.enqueue("store add", stdout=_E409, code=1)
+        fake_ha.enqueue(
+            "store repositories",
+            stdout=_repos([listed]),
+        )
+    result = run_bootstrap()
+    assert result.returncode == 2, result.stdout + result.stderr
+
+
+def test_store_repositories_data_as_plain_list_is_understood(run_bootstrap, fake_ha):
+    """SYNTHETIC fixture (no real 2026.10 `store repositories --raw-json` sample
+    exists in the K31 gate logs or rc6 scratch): the Supervisor REST API returns
+    `data` as a plain list of {slug,name,source,...}. Guards the jq path."""
+    fake_ha.enqueue("store add", stdout=_E409, code=1)
+    fake_ha.enqueue(
+        "store repositories",
+        stdout='{"result":"ok","data":[{"slug":"core","name":"Official","source":"core"},'
+               '{"slug":"abc12345","name":"GA","source":"https://example.invalid/vibe_addons.git"}]}',
+    )
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _count(result, "store add") == 1
+
+
+def test_creds_found_under_supervisor_2026_10_apps_root(run_bootstrap, tmp_path, bootstrap_env):
+    """Supervisor 2026.10 renamed the host data root addons/ -> apps/."""
+    import json
+    d = tmp_path / "sup" / "apps" / "data" / "99f1cad4_ga_manager"
+    d.mkdir(parents=True)
+    (d / "ghcr-creds.json").write_text(json.dumps({"ghcr.io": {"username": "u", "password": "p"}}))
+    result = run_bootstrap(
+        GHCR_CREDS_FILE=str(tmp_path / "missing.json"),
+        SUPERVISOR_DATA_ROOTS=f"{tmp_path}/sup/apps/data {tmp_path}/sup/addons/data",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "found via fallback" in result.stdout + result.stderr
+    assert "/sup/apps/data/" in result.stdout + result.stderr
