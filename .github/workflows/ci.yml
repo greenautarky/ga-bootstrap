@@ -59,7 +59,8 @@ jobs:
           echo "${JQ_SHA256}  /tmp/jq.tgz" | sha256sum -c -
           tar -xzf /tmp/jq.tgz -C /tmp
           cd "/tmp/jq-${JQ_VERSION}"
-          ./configure --without-oniguruma --disable-docs --disable-maintainer-mode --prefix=/opt/jq-nooni
+          # gcc 15 defaults to C23, which jq 1.7.1 does not compile under
+          CFLAGS="-O2 -std=gnu17" ./configure --without-oniguruma --disable-docs --disable-maintainer-mode --prefix=/opt/jq-nooni
           make -j"$(nproc)"
           sudo make install
       - name: Install

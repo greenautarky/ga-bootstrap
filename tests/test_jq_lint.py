@@ -12,7 +12,6 @@ import re
 from pathlib import Path
 
 import pytest
-
 from conftest import BOOTSTRAP_SCRIPT
 
 FIXTURES = Path(__file__).parent / "fixtures" / "jq_lint"
