@@ -9,6 +9,7 @@ sandbox env, then asserts on:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -621,6 +622,10 @@ _MOUNTS_NO_SOCK = "/data\n/config\n/share\n"
 _MOUNTS_SOCK = "/data\n/config\n/run/docker.sock\n"
 
 
+def _repos(sources):
+    return json.dumps({"result": "ok", "data": {"repositories": [{"source": x} for x in sources]}})
+
+
 def _gm_restarts(result):
     return [c for c in result.ha_calls if c[:3] == ["addons", "restart", "99f1cad4_ga_manager"]]
 
@@ -630,12 +635,12 @@ def _enqueue_info(fake_ha, protected):
     fake_ha.enqueue("addons info", stdout='{"result":"ok","data":{"version":"0.27.0"}}')
     fake_ha.enqueue(
         "addons info",
-        stdout='{"result":"ok","data":{"version":"0.27.0","protected":%s}}' % protected,
+        stdout=json.dumps({"result": "ok", "data": {"version": "0.27.0", "protected": protected}}),
     )
 
 
 def test_3a_protected_false_and_socket_bound_is_skipped(run_bootstrap, fake_ha, fake_docker):
-    _enqueue_info(fake_ha, "false")
+    _enqueue_info(fake_ha, False)
     fake_docker.enqueue(_INSPECT, stdout=_MOUNTS_SOCK)
     result = run_bootstrap()
     assert result.returncode == 0, result.stdout + result.stderr
@@ -646,7 +651,7 @@ def test_3a_protected_false_and_socket_bound_is_skipped(run_bootstrap, fake_ha, 
 
 def test_3a_protected_false_but_socket_absent_restarts_once(run_bootstrap, fake_ha, fake_docker):
     """The rc6 end state: flag already false, container never recreated."""
-    _enqueue_info(fake_ha, "false")
+    _enqueue_info(fake_ha, False)
     fake_docker.enqueue(_INSPECT, stdout=_MOUNTS_NO_SOCK)
     result = run_bootstrap()
     assert result.returncode == 0, result.stdout + result.stderr
@@ -657,7 +662,7 @@ def test_3a_protected_false_but_socket_absent_restarts_once(run_bootstrap, fake_
 
 def test_3a_protected_false_old_style_var_run_socket_counts_as_bound(
         run_bootstrap, fake_ha, fake_docker):
-    _enqueue_info(fake_ha, "false")
+    _enqueue_info(fake_ha, False)
     fake_docker.enqueue(_INSPECT, stdout="/data\n/var/run/docker.sock\n")
     result = run_bootstrap()
     assert result.returncode == 0, result.stdout + result.stderr
@@ -666,7 +671,7 @@ def test_3a_protected_false_old_style_var_run_socket_counts_as_bound(
 
 def test_3a_protected_false_uninspectable_container_does_not_restart_but_warns(
         run_bootstrap, fake_ha, fake_docker):
-    _enqueue_info(fake_ha, "false")
+    _enqueue_info(fake_ha, False)
     fake_docker.enqueue(_INSPECT, stderr="Error: No such object", code=1)
     result = run_bootstrap()
     assert result.returncode == 0, result.stdout + result.stderr
@@ -675,7 +680,7 @@ def test_3a_protected_false_uninspectable_container_does_not_restart_but_warns(
 
 
 def test_3a_runs_when_protected_true(run_bootstrap, fake_ha, bootstrap_env):
-    _enqueue_info(fake_ha, "true")
+    _enqueue_info(fake_ha, True)
     result = run_bootstrap()
     assert result.returncode == 0, result.stdout + result.stderr
     assert _security_posts(result)
@@ -696,7 +701,7 @@ def test_store_source_match_is_normalised(run_bootstrap, fake_ha, listed):
     fake_ha.enqueue("store add", stdout=_E409, code=1)
     fake_ha.enqueue(
         "store repositories",
-        stdout='{"result":"ok","data":{"repositories":[{"source":"%s"}]}}' % listed,
+        stdout=_repos([listed]),
     )
     result = run_bootstrap()
     assert result.returncode == 0, result.stdout + result.stderr
@@ -713,7 +718,7 @@ def test_store_source_match_does_not_overmatch(run_bootstrap, fake_ha, listed):
         fake_ha.enqueue("store add", stdout=_E409, code=1)
         fake_ha.enqueue(
             "store repositories",
-            stdout='{"result":"ok","data":{"repositories":[{"source":"%s"}]}}' % listed,
+            stdout=_repos([listed]),
         )
     result = run_bootstrap()
     assert result.returncode == 2, result.stdout + result.stderr
