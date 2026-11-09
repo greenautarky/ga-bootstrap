@@ -22,6 +22,9 @@
 #   2 — Adding the vibe_addons store failed (network / supervisor error).
 #   3 — Writing GHCR credentials failed.
 #   4 — `ha addons install ga_manager` failed.
+#   5 — jq itself failed while checking the store list (program error /
+#       jq not runnable / mktemp failed): a broken image, NOT retryable —
+#       distinct from 2 (store did not register after all retries).
 #
 # Env overrides (read from /etc/ga/ga-bootstrap.conf if present, then
 # from the environment — env wins):
@@ -158,15 +161,49 @@ fi
 # BOSv1.2.4 — proven against transient supervisor-git-clone races in the
 # field. The build-test BS-RETRY-01/02 enforces both exist.
 
+# Return codes (never conflate them — a jq PROGRAM error used to look exactly
+# like "not present" and made bootstrap retry-loop silently, Odoo #1610):
+#   0 repo is listed        1 not listed / transient (retryable, WARN logged)
+#   2 ERROR: the jq PROGRAM failed on valid JSON, or jq cannot run at all
+#     (rc 126/127), or mktemp failed. Logged at error level with rc + jq's
+#     stderr; the caller must NOT retry and exits with code 5.
+# Transient things are rc 1 with a WARN, never fatal: `ha` failing, an empty /
+# non-JSON reply (HTML 502, truncated JSON, text — jq 1.7 answers rc 5 for
+# those too, so input parsing is checked in its OWN jq call first), and valid
+# JSON of an unexpected shape. The program itself is total over JSON types, so
+# a program failure can only mean a broken jq/program. There is no pipefail, so
+# ha and jq run as separate steps; `ha ... | jq` would hide ha's exit status.
 addon_repo_present() {
   # ha store repositories --raw-json lists configured repos under .data
   # (an object with .repositories, or - as the Supervisor API returns it - a
   # plain list). Source URLs are compared normalised: case, scheme, trailing
   # slashes and a trailing ".git" are ignored (Odoo #1610 round 2).
-  # shellcheck disable=SC2016  # $url is a JQ variable bound by --arg, not a
-  # shell variable — single quotes are required, not a mistake.
-  "$HA_CLI" store repositories --no-progress --raw-json 2>/dev/null \
-    | "$JQ_CLI" -e --arg url "$VIBE_STORE_URL" '
+  ha_rc=0
+  repos=$("$HA_CLI" store repositories --no-progress --raw-json 2>/dev/null) || ha_rc=$?
+  if [ "$ha_rc" -ne 0 ]; then
+    log "WARN: 'ha store repositories' failed (rc=$ha_rc) — treating the repo as not listed"
+    return 1
+  fi
+  jq_err=$(mktemp -t ga-bootstrap-jq.XXXXXX) || {
+    log "ERROR: mktemp failed in addon_repo_present — cannot capture jq stderr"
+    return 2
+  }
+  # Step 1: is the reply JSON at all? (a failure here is the INPUT, transient)
+  jq_rc=0
+  printf '%s' "$repos" | "$JQ_CLI" -e 'type' >/dev/null 2>"$jq_err" || jq_rc=$?
+  jq_msg=$(cat "$jq_err" 2>/dev/null || true)
+  if [ "$jq_rc" -eq 126 ] || [ "$jq_rc" -eq 127 ]; then
+    rm -f "$jq_err"
+    log "ERROR: jq cannot be executed in addon_repo_present (rc=$jq_rc): $jq_msg"
+    return 2
+  elif [ "$jq_rc" -ne 0 ]; then
+    rm -f "$jq_err"
+    log "WARN: 'ha store repositories' reply is not valid JSON (jq rc=$jq_rc): ${jq_msg:-empty reply} — treating the repo as not listed"
+    return 1
+  fi
+  # Step 2: the real program. Prints true / false / shape:<what was wrong>.
+  # shellcheck disable=SC2016  # $url is a JQ variable bound by --arg.
+  jq_out=$(printf '%s' "$repos" | "$JQ_CLI" -r --arg url "$VIBE_STORE_URL" '
         # NO regex builtins here (sub/test/match/capture/scan/gsub/splits):
         # the shipped jq is built WITHOUT oniguruma, so any of them exits 5
         # and this function would never return true (rc7 gate, Odoo #1610).
@@ -181,10 +218,45 @@ addon_repo_present() {
         def rtrim_slash: until(endswith("/") | not; .[:-1]);
         def norm: ascii_downcase | strip_scheme | rtrim_slash
                   | if endswith(".git") then .[:-4] else . end | rtrim_slash;
-        (.data.repositories? // .repositories? // .data? // [])
-        | map((.source? // "") | if type == "string" then norm else "" end)
-        | any(. == ($url | norm))
-      ' >/dev/null 2>&1
+        # total over JSON shapes: every step is guarded on type
+        def repo_list:
+          if type == "array" then .
+          elif type == "object" then
+            (if (.data | type) == "object" and (.data.repositories | type) == "array" then .data.repositories
+             elif (.repositories | type) == "array" then .repositories
+             elif (.data | type) == "array" then .data
+             else null end)
+          else null end;
+        . as $in
+        | (repo_list) as $l
+        | if $l == null then "shape:top=\($in | type) data=\(if ($in | type) == "object" then ($in.data | type) else "n/a" end)"
+          else ($l | map(if type == "object" and (.source | type) == "string" then (.source | norm) else "" end)
+                   | any(. == ($url | norm)))
+          end
+      ' 2>"$jq_err") && jq_rc=0 || jq_rc=$?
+  jq_msg=$(cat "$jq_err" 2>/dev/null || true)
+  rm -f "$jq_err"
+  if [ "$jq_rc" -ne 0 ]; then
+    log "ERROR: jq failed in addon_repo_present (rc=$jq_rc): $jq_msg"
+    return 2
+  fi
+  case "$jq_out" in
+    true) return 0 ;;
+    false) return 1 ;;
+    shape:*)
+      log "WARN: 'ha store repositories' reply has an unexpected JSON shape (${jq_out#shape:}) — treating the repo as not listed"
+      return 1 ;;
+    *"
+"*)
+      # Several concatenated JSON documents: each prints its own line. A doubled
+      # or concatenated reply is a transient oddity of the reply, not a program
+      # error — retry it like any other malformed reply (re-review of #11).
+      log "WARN: 'ha store repositories' reply holds several JSON documents — treating the repo as not listed"
+      return 1 ;;
+    *)
+      log "ERROR: jq in addon_repo_present printed unexpected output: $jq_out"
+      return 2 ;;
+  esac
 }
 
 log "adding vibe_addons store ($VIBE_STORE_URL) — with retry"
@@ -211,7 +283,12 @@ for pre_sleep in $BACKOFF_SEQUENCE; do
   # HTTP 409 whose CLI text no longer contains "already" (measured on a
   # canary, Odoo #1610), so the old grep looped forever and never reached
   # step 3a. A 409 counts as "registered" ONLY if the repo is listed.
-  if addon_repo_present; then
+  present_rc=0
+  addon_repo_present || present_rc=$?
+  if [ "$present_rc" -eq 2 ]; then
+    fail "jq error while checking the store list (see ERROR above) — not retrying" 5
+  fi
+  if [ "$present_rc" -eq 0 ]; then
     if [ "$rc" -ne 0 ]; then
       log "store add returned $rc but the repo is listed — store already registered"
     fi
@@ -247,7 +324,13 @@ for pre_sleep in $BACKOFF_SEQUENCE; do
     printf '%s' "$store_output" | head -2 | while IFS= read -r l; do log "  supervisor: $l"; done
     if "$HA_CLI" jobs options --ignore-conditions supervisor_updated --no-progress >/dev/null 2>&1; then
       log "lifted supervisor_updated condition — retrying store add immediately"
-      if "$HA_CLI" --no-progress store add "$VIBE_STORE_URL" >/dev/null 2>&1 && addon_repo_present; then
+      present_rc=1
+      if "$HA_CLI" --no-progress store add "$VIBE_STORE_URL" >/dev/null 2>&1; then
+        present_rc=0
+        addon_repo_present || present_rc=$?
+        [ "$present_rc" -ne 2 ] || fail "jq error while checking the store list (see ERROR above) — not retrying" 5
+      fi
+      if [ "$present_rc" -eq 0 ]; then
         log "vibe_addons store registered + verified (after lifting the condition)"
         store_added=1
         "$HA_CLI" store reload --no-progress >/dev/null 2>&1 || true

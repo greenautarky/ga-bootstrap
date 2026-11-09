@@ -774,3 +774,92 @@ def test_store_repositories_non_string_source_does_not_crash_or_match(run_bootst
                         stdout='{"result":"ok","data":[{"slug":"x","source":null},{"slug":"y"}]}')
     result = run_bootstrap()
     assert result.returncode == 2, result.stdout + result.stderr
+
+
+def _jq_wrapper(tmp_path, rc: int, msg: str) -> str:
+    w = tmp_path / "jq-broken"
+    # passes the cheap `-e type` input-parse check, fails the real program
+    w.write_text(
+        f"#!/bin/sh\n[ \"$2\" = type ] && exit 0\necho '{msg}' >&2\nexit {rc}\n"
+    )
+    w.chmod(0o755)
+    return str(w)
+
+
+@pytest.mark.parametrize("rc", [2, 3, 5])
+def test_jq_program_error_is_loud_and_not_retried(run_bootstrap, tmp_path, bootstrap_env, rc):
+    """A jq compile/runtime error (e.g. image jq without oniguruma, rc 5) used
+    to look like "repo not listed" and loop silently to exit 2 after 6 tries.
+    Now: ERROR with rc + jq's stderr, no 'NOT listed' retry, no 6x store add."""
+    msg = "jq: error: compiled without ONIGURUMA"
+    result = run_bootstrap(JQ_CLI=_jq_wrapper(tmp_path, rc, msg))
+    out = result.stdout + result.stderr
+    assert result.returncode == 5, out
+    assert f"ERROR: jq failed in addon_repo_present (rc={rc})" in out, out
+    assert msg in out, out
+    assert "NOT listed" not in out, out
+    assert sum("store add" in " ".join(c) for c in result.ha_calls) == 1, result.ha_calls
+    assert not Path(bootstrap_env["MARKER"]).exists()
+
+
+def test_ha_failure_in_repo_listing_is_not_masked(run_bootstrap, fake_ha, bootstrap_env):
+    """`ha store repositories` failing must be logged with its rc, not hidden
+    behind the pipe's jq status."""
+    for _ in range(6):
+        fake_ha.enqueue("store add", stdout="ok", code=0)
+        fake_ha.enqueue("store repositories", stdout="", stderr="boom", code=7)
+    result = run_bootstrap()
+    out = result.stdout + result.stderr
+    assert result.returncode == 2, out
+    assert "'ha store repositories' failed (rc=7)" in out, out
+
+
+_HAPPY = '{"result":"ok","data":{"repositories":[{"source":"https://example.invalid/vibe_addons"}]}}'
+_TRANSIENT_REPLIES = {
+    "html_502": "<html><body><h1>502 Bad Gateway</h1></body></html>",
+    "truncated_json": '{"result":"ok","data":{"repositories":[{"sour',
+    "plain_text": "Error: connection refused",
+    "empty": "",
+    "data_string": '{"result":"error","data":"boom"}',
+    "data_number": '{"result":"ok","data":42}',
+    "repositories_string": '{"data":{"repositories":"x"}}',
+    "top_level_string": '"just a string"',
+    "top_level_number": "7",
+    "top_level_null": "null",
+    "elements_not_objects": '{"data":{"repositories":["a",1,null]}}',
+    # Two concatenated documents: parses, but the program prints one line per
+    # document (true + false). Found by the re-review of #11; must not be fatal.
+    "two_documents_true_false": '[{"source":"https://example.invalid/vibe_addons"}] []',
+    "two_documents_true_true": '[{"source":"https://example.invalid/vibe_addons"}] [{"source":"https://example.invalid/vibe_addons"}]',
+}
+
+
+@pytest.mark.parametrize("name", sorted(_TRANSIENT_REPLIES))
+def test_bad_store_listing_is_a_retryable_warn_with_the_real_jq(
+        run_bootstrap, fake_ha, bootstrap_env, name):
+    """REAL jq (CI's no-oniguruma jq via JQ_CLI, else runner jq), no stub. jq 1.7
+    answers rc 5 for non-JSON INPUT and for wrong-shape JSON; neither may be
+    fatal. Every attempt retries; after all of them the usual exit 2."""
+    for _ in range(6):
+        fake_ha.enqueue("store add", stdout="ok", code=0)
+        fake_ha.enqueue("store repositories", stdout=_TRANSIENT_REPLIES[name], code=0)
+    result = run_bootstrap()
+    out = result.stdout + result.stderr
+    assert result.returncode == 2, out
+    assert "ERROR: jq" not in out, out
+    assert out.count("WARN: 'ha store repositories' reply") + out.count("not yet visible") >= 2, out
+    assert sum("store add" in " ".join(c) for c in result.ha_calls) >= 2, result.ha_calls
+
+
+def test_top_level_array_with_the_repo_is_listed(run_bootstrap, fake_ha, bootstrap_env):
+    fake_ha.enqueue("store repositories",
+                    stdout='[{"source":"https://example.invalid/vibe_addons.git/"}]')
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_blip_then_recovery_succeeds(run_bootstrap, fake_ha, bootstrap_env):
+    fake_ha.enqueue("store repositories", stdout="<html>502</html>")
+    fake_ha.enqueue("store repositories", stdout=_HAPPY)
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
