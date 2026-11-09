@@ -246,6 +246,13 @@ addon_repo_present() {
     shape:*)
       log "WARN: 'ha store repositories' reply has an unexpected JSON shape (${jq_out#shape:}) — treating the repo as not listed"
       return 1 ;;
+    *"
+"*)
+      # Several concatenated JSON documents: each prints its own line. A doubled
+      # or concatenated reply is a transient oddity of the reply, not a program
+      # error — retry it like any other malformed reply (re-review of #11).
+      log "WARN: 'ha store repositories' reply holds several JSON documents — treating the repo as not listed"
+      return 1 ;;
     *)
       log "ERROR: jq in addon_repo_present printed unexpected output: $jq_out"
       return 2 ;;

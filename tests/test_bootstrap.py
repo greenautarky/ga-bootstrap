@@ -827,6 +827,10 @@ _TRANSIENT_REPLIES = {
     "top_level_number": "7",
     "top_level_null": "null",
     "elements_not_objects": '{"data":{"repositories":["a",1,null]}}',
+    # Two concatenated documents: parses, but the program prints one line per
+    # document (true + false). Found by the re-review of #11; must not be fatal.
+    "two_documents_true_false": '[{"source":"https://example.invalid/vibe_addons"}] []',
+    "two_documents_true_true": '[{"source":"https://example.invalid/vibe_addons"}] [{"source":"https://example.invalid/vibe_addons"}]',
 }
 
 

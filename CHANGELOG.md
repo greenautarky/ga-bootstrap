@@ -1,5 +1,7 @@
 ## 1.2.13 — 2026-11-09
 
+- A store listing holding several concatenated JSON documents is a retryable WARN, not a fatal exit 5 (re-review of #11).
+
 ### fix: `addon_repo_present` works with the image's jq (built without oniguruma)
 
 Before: the URL normalisation used `sub(...)`. The iHost image ships jq 1.7.1
