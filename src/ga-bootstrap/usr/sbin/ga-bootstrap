@@ -174,13 +174,14 @@ addon_repo_present() {
   # slashes and a trailing ".git" are ignored (Odoo #1610 round 2).
   # shellcheck disable=SC2016  # $url is a JQ variable bound by --arg, not a
   # shell variable — single quotes are required, not a mistake.
-  local repos jq_err jq_rc ha_rc=0
+  ha_rc=0
   repos=$("$HA_CLI" store repositories --no-progress --raw-json 2>/dev/null) || ha_rc=$?
   if [ "$ha_rc" -ne 0 ]; then
     log "WARN: 'ha store repositories' failed (rc=$ha_rc) — treating the repo as not listed"
     return 1
   fi
   jq_err=$(mktemp -t ga-bootstrap-jq.XXXXXX)
+  # shellcheck disable=SC2016  # $url is a JQ variable bound by --arg.
   printf '%s' "$repos" | "$JQ_CLI" -e --arg url "$VIBE_STORE_URL" '
         # NO regex builtins here (sub/test/match/capture/scan/gsub/splits):
         # the shipped jq is built WITHOUT oniguruma, so any of them exits 5
