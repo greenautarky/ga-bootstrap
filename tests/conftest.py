@@ -292,3 +292,17 @@ def run_bootstrap(fake_ha: FakeHA, fake_docker: FakeDocker,
         return result
 
     return _run
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _require_jq_without_oniguruma():
+    """CI sets GA_REQUIRE_NO_ONIGURUMA=1 and JQ_CLI to a jq built like the
+    iHost image's (no oniguruma). Prove that jq really lacks regex, so a CI
+    runner jq that quietly has it cannot make the suite green again."""
+    if os.environ.get("GA_REQUIRE_NO_ONIGURUMA") != "1":
+        return
+    jq = os.environ.get("JQ_CLI", "jq")
+    r = subprocess.run([jq, "-n", '"a" | sub("a"; "b")'],
+                       capture_output=True, text=True, check=False)
+    assert r.returncode == 5 and "ONIGURUMA" in r.stderr.upper(), (
+        f"{jq} has regex support (rc={r.returncode}): not a faithful device jq")

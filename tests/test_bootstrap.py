@@ -752,3 +752,25 @@ def test_creds_found_under_supervisor_2026_10_apps_root(run_bootstrap, tmp_path,
     assert result.returncode == 0, result.stdout + result.stderr
     assert "found via fallback" in result.stdout + result.stderr
     assert "/sup/apps/data/" in result.stdout + result.stderr
+
+
+def test_store_repositories_object_form_is_understood(run_bootstrap, fake_ha):
+    """`data` as an object with .repositories (the other documented shape)."""
+    fake_ha.enqueue("store add", stdout=_E409, code=1)
+    fake_ha.enqueue(
+        "store repositories",
+        stdout='{"result":"ok","data":{"repositories":[{"slug":"core","source":"core"},'
+               '{"slug":"abc12345","source":"HTTPS://Example.Invalid/Vibe_Addons.git/"}]}}',
+    )
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _count(result, "store add") == 1
+
+
+def test_store_repositories_non_string_source_does_not_crash_or_match(run_bootstrap, fake_ha):
+    for _ in range(6):
+        fake_ha.enqueue("store add", stdout=_E409, code=1)
+        fake_ha.enqueue("store repositories",
+                        stdout='{"result":"ok","data":[{"slug":"x","source":null},{"slug":"y"}]}')
+    result = run_bootstrap()
+    assert result.returncode == 2, result.stdout + result.stderr

@@ -1,3 +1,22 @@
+## 1.2.13 — 2026-11-09
+
+### fix: `addon_repo_present` works with the image's jq (built without oniguruma)
+
+Before: the URL normalisation used `sub(...)`. The iHost image ships jq 1.7.1
+built **without** oniguruma, where every regex builtin exits 5, so the function
+never returned true. On a fresh device the store was added, the 409 on re-add
+was not recognised as "registered", and bootstrap looped to exit 2 without ever
+installing ga_manager (BOSv1.6.0-rc7 K31 gate, Odoo #1610).
+
+After: the normalisation uses `ascii_downcase`, `split`/`join`, `explode`,
+`endswith` and slicing only. Same semantics: case, scheme, trailing slashes and
+a trailing `.git` are ignored.
+
+Mechanism: `tests/test_jq_lint.py` rejects regex builtins in the live script's jq
+programs (must-fail and must-pass fixtures under `tests/fixtures/jq_lint/`, fails
+on zero programs found), and CI job `test-jq-no-oniguruma` runs the whole suite
+with a jq built `--without-oniguruma`, after proving that jq has no regex.
+
 ## 1.2.12 — 2026-11-09
 
 ### fix: a re-run no longer loops on Supervisor 2026.10's store 409, and step 3a always gets reached (Odoo #1610)
