@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 
 def _called(result, verb_prefix: str) -> bool:
     return any(verb_prefix in " ".join(call) for call in result.ha_calls)
@@ -614,30 +616,122 @@ def test_unexpected_store_add_error_is_loud(run_bootstrap, fake_ha, bootstrap_en
     assert "kaboom" in out
 
 
-def test_3a_is_idempotent_when_already_unprotected(run_bootstrap, fake_ha, bootstrap_env):
+_INSPECT = "inspect addon_99f1cad4_ga_manager"
+_MOUNTS_NO_SOCK = "/data\n/config\n/share\n"
+_MOUNTS_SOCK = "/data\n/config\n/run/docker.sock\n"
+
+
+def _gm_restarts(result):
+    return [c for c in result.ha_calls if c[:3] == ["addons", "restart", "99f1cad4_ga_manager"]]
+
+
+def _enqueue_info(fake_ha, protected):
     # 3a only queries once step 4 passed: install check, then 3a's own query.
     fake_ha.enqueue("addons info", stdout='{"result":"ok","data":{"version":"0.27.0"}}')
     fake_ha.enqueue(
         "addons info",
-        stdout='{"result":"ok","data":{"version":"0.27.0","protected":false}}',
+        stdout='{"result":"ok","data":{"version":"0.27.0","protected":%s}}' % protected,
     )
+
+
+def test_3a_protected_false_and_socket_bound_is_skipped(run_bootstrap, fake_ha, fake_docker):
+    _enqueue_info(fake_ha, "false")
+    fake_docker.enqueue(_INSPECT, stdout=_MOUNTS_SOCK)
     result = run_bootstrap()
     assert result.returncode == 0, result.stdout + result.stderr
     assert not _security_posts(result)
-    assert not any(c[:2] == ["addons", "restart"] for c in result.ha_calls)
-    assert "already has protected=false" in result.stdout + result.stderr
+    assert not _gm_restarts(result)
+    assert "docker.sock is bound" in result.stdout + result.stderr
+
+
+def test_3a_protected_false_but_socket_absent_restarts_once(run_bootstrap, fake_ha, fake_docker):
+    """The rc6 end state: flag already false, container never recreated."""
+    _enqueue_info(fake_ha, "false")
+    fake_docker.enqueue(_INSPECT, stdout=_MOUNTS_NO_SOCK)
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(_gm_restarts(result)) == 1
+    assert not _security_posts(result), "flag is already false: no second flip"
+    assert "NO docker.sock bound" in result.stdout + result.stderr
+
+
+def test_3a_protected_false_old_style_var_run_socket_counts_as_bound(
+        run_bootstrap, fake_ha, fake_docker):
+    _enqueue_info(fake_ha, "false")
+    fake_docker.enqueue(_INSPECT, stdout="/data\n/var/run/docker.sock\n")
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not _gm_restarts(result)
+
+
+def test_3a_protected_false_uninspectable_container_does_not_restart_but_warns(
+        run_bootstrap, fake_ha, fake_docker):
+    _enqueue_info(fake_ha, "false")
+    fake_docker.enqueue(_INSPECT, stderr="Error: No such object", code=1)
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not _gm_restarts(result)
+    assert "cannot inspect" in result.stdout + result.stderr
 
 
 def test_3a_runs_when_protected_true(run_bootstrap, fake_ha, bootstrap_env):
-    fake_ha.enqueue("addons info", stdout='{"result":"ok","data":{"version":"0.27.0"}}')
-    fake_ha.enqueue(
-        "addons info",
-        stdout='{"result":"ok","data":{"version":"0.27.0","protected":true}}',
-    )
+    _enqueue_info(fake_ha, "true")
     result = run_bootstrap()
     assert result.returncode == 0, result.stdout + result.stderr
     assert _security_posts(result)
-    assert any(c[:2] == ["addons", "restart"] for c in result.ha_calls)
+    assert len(_gm_restarts(result)) == 1, "flip + exactly one restart"
+
+
+# Store source matching: case, scheme, trailing slash and ".git" are ignored.
+
+@pytest.mark.parametrize("listed", [
+    "https://example.invalid/vibe_addons/",
+    "https://example.invalid/vibe_addons.git",
+    "https://example.invalid/vibe_addons.git/",
+    "http://example.invalid/vibe_addons",
+    "HTTPS://Example.Invalid/Vibe_Addons",
+    "git+https://example.invalid/vibe_addons.git",
+])
+def test_store_source_match_is_normalised(run_bootstrap, fake_ha, listed):
+    fake_ha.enqueue("store add", stdout=_E409, code=1)
+    fake_ha.enqueue(
+        "store repositories",
+        stdout='{"result":"ok","data":{"repositories":[{"source":"%s"}]}}' % listed,
+    )
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _count(result, "store add") == 1, f"{listed!r} must count as registered"
+
+
+@pytest.mark.parametrize("listed", [
+    "https://example.invalid/vibe_addons_other",
+    "https://other.invalid/vibe_addons",
+    "https://example.invalid/vibe_addons/sub",
+])
+def test_store_source_match_does_not_overmatch(run_bootstrap, fake_ha, listed):
+    for _ in range(6):
+        fake_ha.enqueue("store add", stdout=_E409, code=1)
+        fake_ha.enqueue(
+            "store repositories",
+            stdout='{"result":"ok","data":{"repositories":[{"source":"%s"}]}}' % listed,
+        )
+    result = run_bootstrap()
+    assert result.returncode == 2, result.stdout + result.stderr
+
+
+def test_store_repositories_data_as_plain_list_is_understood(run_bootstrap, fake_ha):
+    """SYNTHETIC fixture (no real 2026.10 `store repositories --raw-json` sample
+    exists in the K31 gate logs or rc6 scratch): the Supervisor REST API returns
+    `data` as a plain list of {slug,name,source,...}. Guards the jq path."""
+    fake_ha.enqueue("store add", stdout=_E409, code=1)
+    fake_ha.enqueue(
+        "store repositories",
+        stdout='{"result":"ok","data":[{"slug":"core","name":"Official","source":"core"},'
+               '{"slug":"abc12345","name":"GA","source":"https://example.invalid/vibe_addons.git"}]}',
+    )
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _count(result, "store add") == 1
 
 
 def test_creds_found_under_supervisor_2026_10_apps_root(run_bootstrap, tmp_path, bootstrap_env):

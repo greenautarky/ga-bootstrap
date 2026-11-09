@@ -14,8 +14,16 @@ After: the store is "registered" when the repo is **listed** (`ha store
 repositories`), whatever the reply wording or exit code. A 409 counts only if
 the repo is listed. Any other failure with the repo not listed logs a `WARN`
 with the first line of the reply and retries; after 6 attempts it still exits 2.
-Step 3a is idempotent: if Supervisor already reports `protected=false` it is
-skipped (no flip, no restart), otherwise it flips and restarts as before.
+Step 3a: if Supervisor reports `protected=false` the running container is
+checked (`docker inspect addon_<slug>`, mount destination `/run/docker.sock`
+or `/var/run/docker.sock`): socket bound -> skip; socket absent (the rc6 end
+state: flag flipped, container never recreated) -> restart ga_manager once;
+container not inspectable -> WARN, no restart (ga_manager's own startup guard
+covers it). `protected=true` flips and restarts as before. At most one restart
+per run.
+
+The `store repositories` source match ignores case, scheme, trailing slashes
+and a trailing `.git`, and accepts `data` as an object or a plain list.
 
 ### fix: host data root `apps/` (Supervisor 2026.10)
 

@@ -159,15 +159,20 @@ fi
 # field. The build-test BS-RETRY-01/02 enforces both exist.
 
 addon_repo_present() {
-  # ha store repositories --raw-json lists configured repos under .data.
-  # Compare source URLs with trailing-slash normalisation.
+  # ha store repositories --raw-json lists configured repos under .data
+  # (an object with .repositories, or - as the Supervisor API returns it - a
+  # plain list). Source URLs are compared normalised: case, scheme, trailing
+  # slashes and a trailing ".git" are ignored (Odoo #1610 round 2).
   # shellcheck disable=SC2016  # $url is a JQ variable bound by --arg, not a
   # shell variable — single quotes are required, not a mistake.
   "$HA_CLI" store repositories --no-progress --raw-json 2>/dev/null \
     | "$JQ_CLI" -e --arg url "$VIBE_STORE_URL" '
-        (.data.repositories // .repositories // .data // [])
-        | map((.source // "") | rtrimstr("/"))
-        | any(. == ($url | rtrimstr("/")))
+        def norm: ascii_downcase
+                  | sub("^[a-z][a-z0-9+.-]*://"; "")
+                  | sub("/+$"; "") | sub("\\.git$"; "") | sub("/+$"; "");
+        (.data.repositories? // .repositories? // .data? // [])
+        | map((.source? // "") | if type == "string" then norm else "" end)
+        | any(. == ($url | norm))
       ' >/dev/null 2>&1
 }
 
@@ -470,13 +475,53 @@ fi
 #
 # Best-effort: if the API call fails, log + continue. The addon will run
 # but its self-update path will be broken until an operator fixes it.
-# Idempotent: if Supervisor already reports protected=false (an earlier run
-# got this far) there is nothing to flip and no reason to restart again.
-# Unknown (no/unparseable answer) is treated as "still protected" and flips.
+# Idempotent, but NOT "protected=false means done": the flag says what the
+# NEXT container creation will do, not what the RUNNING container got. The rc6
+# end state was protected=false with no docker.sock bound (flag flipped, add-on
+# never recreated). So when the flag is already false the socket is checked on
+# the running container, and a restart happens if it is absent. At most ONE
+# restart per run either way ($_gm_restarted).
+#
+# Socket signal: `docker inspect` of the add-on's container (addon_<slug>),
+# its .Mounts destinations. Supervisor binds the host Docker socket into an
+# add-on that declares docker_api and is not protected, at /run/docker.sock
+# (older images: /var/run/docker.sock); ga_manager's own interface_check looks
+# at both paths. Mount destination (not a host-side path probe) is the one
+# signal the host can read without entering the container. Unknown (inspect
+# fails: container missing) = no restart from here; ga_manager's own startup
+# guard (docker_socket_guard) covers that case.
+_gm_restarted=0
+gm_docker_sock_state() {
+  mounts=""
+  mounts=$(docker inspect "addon_${GA_MANAGER_SLUG}" \
+             --format '{{range .Mounts}}{{println .Destination}}{{end}}' 2>/dev/null) \
+    || { echo unknown; return 0; }
+  if printf '%s\n' "$mounts" | grep -qxE '/(var/)?run/docker\.sock'; then
+    echo present
+  else
+    echo absent
+  fi
+}
 _prot=$("$HA_CLI" addons info "$GA_MANAGER_SLUG" --no-progress --raw-json 2>/dev/null \
         | "$JQ_CLI" -r '(if .data.protected != null then .data.protected else .protected end | if . == null then "unknown" else tostring end)' 2>/dev/null || true)
 if [ "$_prot" = "false" ]; then
-  log "$GA_MANAGER_SLUG already has protected=false — step 3a not needed (ga_manager restarts itself if the docker.sock is missing)"
+  _sock=$(gm_docker_sock_state)
+  case "$_sock" in
+    present)
+      log "$GA_MANAGER_SLUG already has protected=false and docker.sock is bound — step 3a not needed"
+      ;;
+    absent)
+      log "WARN: $GA_MANAGER_SLUG has protected=false but NO docker.sock bound (flag flipped, container never recreated) — restarting it once"
+      if [ "$_gm_restarted" -eq 0 ]; then
+        _gm_restarted=1
+        "$HA_CLI" addons restart "$GA_MANAGER_SLUG" >/dev/null 2>&1 || \
+          log "WARN: restart of $GA_MANAGER_SLUG (docker.sock missing) failed — ga_manager's own startup guard retries"
+      fi
+      ;;
+    *)
+      log "WARN: protected=false but cannot inspect addon_${GA_MANAGER_SLUG} to see whether docker.sock is bound — not restarting from here (ga_manager's startup guard covers it)"
+      ;;
+  esac
 else
   log "disabling protected mode on $GA_MANAGER_SLUG (= enables docker_api self-update path)"
   if docker exec hassio_cli sh -c 'wget -qO- \
@@ -486,6 +531,7 @@ else
       "http://supervisor/addons/'"$GA_MANAGER_SLUG"'/security"' \
       2>/dev/null | grep -q '"result":"ok"'; then
     log "protected=false applied — restarting $GA_MANAGER_SLUG to pick up correct binds"
+    _gm_restarted=1
     "$HA_CLI" addons restart "$GA_MANAGER_SLUG" >/dev/null 2>&1 || \
       log "WARN: restart after protected=false toggle failed — addon will pick up on next manual restart"
   else
