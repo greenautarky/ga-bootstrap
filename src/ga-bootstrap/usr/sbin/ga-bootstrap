@@ -178,6 +178,30 @@ wait_ready() {
   [ "$_wr_rc" -eq 0 ] || fail "Supervisor never reported state=running ($1)" 8
 }
 
+# `ha store reload` makes Supervisor ls-remote+fetch every registered repo
+# anonymously; repeated reloads on first boot cause HTTP 429 / "store.git:
+# already a task in progress" (Odoo #1752). So: never a readiness probe, never
+# in a retry loop. At most STORE_RELOAD_MAX (2) per run: the first one only
+# after state=running, a second one (recovery ladder) only after a logged
+# backoff of STORE_RELOAD_BACKOFF_S (>= 60 s) via $SLEEP_CMD.
+STORE_RELOAD_COUNT=0
+STORE_RELOAD_MAX="${STORE_RELOAD_MAX:-2}"
+STORE_RELOAD_BACKOFF_S="${STORE_RELOAD_BACKOFF_S:-60}"
+store_reload() {
+  if [ "$STORE_RELOAD_COUNT" -ge "$STORE_RELOAD_MAX" ]; then
+    log "store reload skipped ($1): already $STORE_RELOAD_COUNT this run (429 guard)"
+    return 1
+  fi
+  wait_ready "before store reload ($1)"
+  if [ "$STORE_RELOAD_COUNT" -gt 0 ]; then
+    log "store reload ($1): backing off ${STORE_RELOAD_BACKOFF_S}s after the previous reload (429 guard)"
+    "$SLEEP_CMD" "$STORE_RELOAD_BACKOFF_S"
+  fi
+  STORE_RELOAD_COUNT=$(( STORE_RELOAD_COUNT + 1 ))
+  log "store reload #$STORE_RELOAD_COUNT ($1)"
+  "$HA_CLI" store reload --no-progress >/dev/null 2>&1
+}
+
 # --- 0. marker check (idempotent) -------------------------------------
 if [ -f "$MARKER" ]; then
   log "marker $MARKER present — bootstrap already completed, exiting 0"
@@ -352,7 +376,6 @@ store_added=0
 for pre_sleep in $BACKOFF_SEQUENCE; do
   if [ "$pre_sleep" -gt 0 ]; then
     log "waiting ${pre_sleep}s before retry..."
-    "$HA_CLI" store reload --no-progress >/dev/null 2>&1 || true
     sleep "$pre_sleep"
   fi
   # Capture stderr+stdout so we can distinguish "already added" from
@@ -382,7 +405,7 @@ for pre_sleep in $BACKOFF_SEQUENCE; do
     fi
     log "vibe_addons store registered + verified"
     store_added=1
-    "$HA_CLI" store reload --no-progress >/dev/null 2>&1 || true
+    store_reload "after store add" || true
     break
   elif [ "$rc" -eq 0 ]; then
     log "store add returned ok but repo not yet visible — retrying"
@@ -421,7 +444,7 @@ for pre_sleep in $BACKOFF_SEQUENCE; do
       if [ "$present_rc" -eq 0 ]; then
         log "vibe_addons store registered + verified (after lifting the condition)"
         store_added=1
-        "$HA_CLI" store reload --no-progress >/dev/null 2>&1 || true
+        store_reload "after store add" || true
         break
       fi
       log "still not registered after lifting — falling through to backoff"
@@ -583,8 +606,8 @@ store_recovery_ladder() {
     return 0
   fi
   log "WARN: $GA_MANAGER_SLUG does not exist although vibe_addons store is registered — rung 1: ha store reload"
-  "$HA_CLI" store reload --no-progress >/dev/null 2>&1 || \
-    log "WARN: rung 1: store reload returned non-zero"
+  store_reload "recovery rung 1" || \
+    log "WARN: rung 1: store reload skipped or returned non-zero"
   addons_installed "$GA_MANAGER_SLUG" || true
   if ! addon_missing_from_store; then
     log "WARN: rung 1: $GA_MANAGER_SLUG visible after store reload — continuing install"

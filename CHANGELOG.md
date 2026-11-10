@@ -25,6 +25,14 @@ After:
 - StartLimit: shortest failing cycle is now 600 (wait) + 180 (RestartSec) =
   780 s -> at most 3600/780 = 4.6, i.e. <= 5 starts/h, well below
   StartLimitBurst=10 (was 480 s cycle, <= 7/h).
+- `ha store reload` rate limit (Odoo #1752; GitHub 429 / "store.git: already a
+  task in progress" on first boot): reload is no readiness probe and no longer
+  runs before every `store add` retry. `store_reload` runs it after
+  state=running, at most STORE_RELOAD_MAX=2 per run, the second (recovery
+  ladder) only after a logged STORE_RELOAD_BACKOFF_S=60 s backoff. Reload
+  calls per first-boot run, before -> after: happy path 1 -> 1; with 3 failed
+  `store add` retries 4 -> 1; with the recovery ladder 2 -> 2 (now with 60 s
+  gap).
 - Tests: 480 s startup then running succeeds; startup past 600 s -> exit 8;
   two waits together sleep exactly 600 s at most.
 

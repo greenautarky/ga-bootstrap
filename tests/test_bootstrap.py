@@ -1044,8 +1044,8 @@ def test_still_startup_after_600s_is_exit_8(run_bootstrap, fake_ha, bootstrap_en
 
 def test_two_readiness_waits_share_one_600s_budget(
         run_bootstrap, fake_ha, bootstrap_env, tmp_path):
-    """First wait burns 480 s, then ready; Supervisor falls back to startup
-    before the first start: that wait may use only the remaining 120 s."""
+    """The store-reload wait burns 480 s, then ready; Supervisor falls back to
+    startup before install: that wait may use only the remaining 120 s."""
     for _ in range(48):
         fake_ha.enqueue("info", stdout=_STARTUP)
     fake_ha.enqueue("info", stdout='{"result":"ok","data":{"state":"running"}}')
@@ -1053,6 +1053,36 @@ def test_two_readiness_waits_share_one_600s_budget(
         fake_ha.enqueue("info", stdout=_STARTUP)
     result = run_bootstrap(GM_READY_STEP_S="10")
     assert result.returncode == 8, result.stdout + result.stderr
-    assert "before first start" in result.stdout + result.stderr
-    assert not [c for c in result.ha_calls if c[:2] == ["addons", "start"]]
+    assert "before install" in result.stdout + result.stderr
+    assert not [c for c in result.ha_calls if c[:2] == ["addons", "install"]]
     assert _slept_total(tmp_path) == 600, "2 waits together must not exceed the bound"
+
+
+# --- Odoo #1752: store reload is rate-limited (GitHub 429 on first boot) ----
+
+def test_store_reload_happy_path_at_most_once(run_bootstrap):
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _count(result, "store reload") <= 1
+
+
+def test_store_reload_with_store_add_retries_at_most_once(run_bootstrap, fake_ha):
+    """Old code reloaded before EVERY backoff retry of `store add`."""
+    for _ in range(3):
+        fake_ha.enqueue("store add", code=1, stderr="Error: clone failed")
+        fake_ha.enqueue("store repositories",
+                        stdout='{"result":"ok","data":{"repositories":[]}}')
+    result = run_bootstrap(BACKOFF_SEQUENCE="0 1 1 1 1")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _count(result, "store reload") <= 1
+
+
+def test_store_reload_with_ladder_at_most_twice_with_logged_backoff(
+        run_bootstrap, fake_ha, bootstrap_env):
+    fake_ha.addon_missing("always")
+    result = run_bootstrap(STORE_RELOAD_BACKOFF_S="77")
+    assert result.returncode == 4
+    assert _count(result, "store reload") == 2, result.stdout
+    assert "backing off 77s" in result.stdout + result.stderr
+    sleeps = (Path(bootstrap_env["SLEEP_CMD"]).parent / "sleeps.log").read_text().split()
+    assert "77" in sleeps
