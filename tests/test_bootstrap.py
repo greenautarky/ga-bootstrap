@@ -928,7 +928,11 @@ def _jq_wrapper(tmp_path, rc: int, msg: str) -> str:
     w = tmp_path / "jq-broken"
     # passes the cheap `-e type` input-parse check, fails the real program
     w.write_text(
-        f"#!/bin/sh\n[ \"$2\" = type ] && exit 0\ncase \"$2\" in *.data.state*) echo running; exit 0;; esac\necho '{msg}' >&2\nexit {rc}\n"
+        "#!/bin/sh\n"
+        "[ \"$2\" = type ] && exit 0\n"
+        # the ha-info readiness gate (before store add) must still pass
+        "case \"$2\" in *.data.state*) echo running; exit 0;; esac\n"
+        f"echo '{msg}' >&2\nexit {rc}\n"
     )
     w.chmod(0o755)
     return str(w)
