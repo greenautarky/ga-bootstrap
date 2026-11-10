@@ -60,11 +60,21 @@ class FakeHA:
     ) -> None:
         self.responses.setdefault(verb_prefix, []).append((stdout, stderr, code))
 
+    def set_model(self, *, protected: bool = True, container_sock: bool | None = None) -> None:
+        """Initial Supervisor model shared with the docker shim. container_sock
+        None = no container yet; True/False = a container that already exists
+        with / without the docker.sock mount."""
+        container = None if container_sock is None else {"sock": container_sock}
+        self.model_path.write_text(  # type: ignore[attr-defined]
+            json.dumps({"protected": protected, "container": container}))
+
 
 @pytest.fixture
 def fake_ha(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeHA:
     state_path = tmp_path / "fake_ha_state.json"
     log_path = tmp_path / "fake_ha_calls.jsonl"
+    seq_path = tmp_path / "call_sequence.log"
+    model_path = tmp_path / "model.json"
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     fake_path = bin_dir / "ha"
@@ -75,12 +85,15 @@ import json, sys
 from pathlib import Path
 STATE = Path({str(state_path)!r})
 LOG = Path({str(log_path)!r})
+MODEL = Path({str(model_path)!r})
 args = sys.argv[1:]
 # Strip the leading `--no-progress` / `--raw-json` flags so the
 # matcher key is stable regardless of which the script used.
 clean = [a for a in args if not a.startswith('--')]
 key = ' '.join(clean[:2])
 LOG.write_text((LOG.read_text() if LOG.exists() else '') + json.dumps(args) + '\\n')
+with open({str(seq_path)!r}, 'a') as _f:
+    _f.write('ha ' + ' '.join(clean) + '\\n')
 state = json.loads(STATE.read_text()) if STATE.exists() else {{}}
 queue = state.get(key, [])
 flags = state.get('__flags__', {{}})
@@ -115,6 +128,8 @@ else:
         stdout, stderr, code = '', '', 0
     elif key == 'core info':
         stdout, stderr, code = '{{"result":"ok","data":{{"state":"running"}}}}', '', 0
+    elif key == 'info':
+        stdout, stderr, code = '{{"result":"ok","data":{{"state":"running"}}}}', '', 0
     elif key == 'store add':
         stdout, stderr, code = 'Store added', '', 0
     elif key == 'store reload':
@@ -145,6 +160,14 @@ else:
         stdout, stderr, code = '', '', 0
     else:
         stdout, stderr, code = '', f'fake_ha: no default for {{key!r}}', 0
+if code == 0 and key in ('addons start', 'addons restart'):
+    # Model: the container's mounts are fixed at CREATION (start of a
+    # missing container) or RECREATION (restart); socket iff NOT protected
+    # at that moment.
+    _m = json.loads(MODEL.read_text())
+    if key == 'addons restart' or _m.get('container') is None:
+        _m['container'] = {{'sock': not _m['protected']}}
+        MODEL.write_text(json.dumps(_m))
 sys.stdout.write(stdout)
 sys.stderr.write(stderr)
 sys.exit(code)
@@ -153,6 +176,8 @@ sys.exit(code)
     fake_path.chmod(0o755)
 
     controller = FakeHA()
+    controller.model_path = model_path  # type: ignore[attr-defined]
+    model_path.write_text(json.dumps({"protected": True, "container": None}))
 
     # Sync controller.responses → state file before each run via a
     # marker tied to the controller object id.
@@ -184,6 +209,21 @@ class FakeDocker:
                 stderr: str = "", code: int = 0) -> None:
         self.responses.setdefault(verb_prefix, []).append((stdout, stderr, code))
 
+    def post_accepted_but_ignored(self) -> None:
+        """The security POST answers ok but does not change the model."""
+        self.responses["__post_noop__"] = True  # type: ignore[assignment]
+
+    def invisible_first(self, n: int) -> None:
+        """The first n `container inspect` calls fail (container not yet
+        visible right after start)."""
+        self.responses["__invisible_first__"] = n  # type: ignore[assignment]
+
+    def only_containers(self, *names: str, all_names: tuple[str, ...] = (
+            "app_99f1cad4_ga_manager", "addon_99f1cad4_ga_manager")) -> None:
+        """Every container name in all_names NOT in names does not exist
+        (`docker container inspect` fails for it)."""
+        self.responses["__missing__"] = [n for n in all_names if n not in names]  # type: ignore[assignment]
+
 
 @pytest.fixture
 def fake_docker(tmp_path: Path, fake_ha: FakeHA,
@@ -194,6 +234,8 @@ def fake_docker(tmp_path: Path, fake_ha: FakeHA,
     PATH prefix."""
     state_path = tmp_path / "fake_docker_state.json"
     log_path = tmp_path / "fake_docker_calls.jsonl"
+    seq_path = tmp_path / "call_sequence.log"
+    model_path = tmp_path / "model.json"
     bin_dir = tmp_path / "bin"
     # bin_dir already exists from fake_ha
     fake_path = bin_dir / "docker"
@@ -203,21 +245,41 @@ import json, sys
 from pathlib import Path
 STATE = Path({str(state_path)!r})
 LOG = Path({str(log_path)!r})
+MODEL = Path({str(model_path)!r})
 args = sys.argv[1:]
 LOG.write_text((LOG.read_text() if LOG.exists() else '') + json.dumps(args) + '\\n')
 # Match on the first two args (typically "exec hassio_cli").
 key = ' '.join(args[:2])
+with open({str(seq_path)!r}, 'a') as _f:
+    _f.write('docker ' + ' '.join(args[:3]) + '\\n')
 state = json.loads(STATE.read_text()) if STATE.exists() else {{}}
 queue = state.get(key, [])
+model = json.loads(MODEL.read_text())
+if args[:2] == ['container', 'inspect']:
+    _inv = state.get('__invisible_first__', 0)
+    if args[-1] in state.get('__missing__', []) or model['container'] is None or _inv > 0:
+        if _inv > 0 and args[-1] not in state.get('__missing__', []):
+            state['__invisible_first__'] = _inv - 1
+            STATE.write_text(json.dumps(state))
+        sys.stderr.write('Error: No such container: ' + args[-1])
+        sys.exit(1)
 if queue:
     stdout, stderr, code = queue[0]
     state[key] = queue[1:]
     STATE.write_text(json.dumps(state))
+elif args[:1] == ['inspect']:
+    # Mounts as modelled: socket iff the container was created unprotected.
+    _sock = model['container'] is not None and model['container']['sock']
+    stdout, stderr, code = '/data\\n' + ('/run/docker.sock\\n' if _sock else ''), '', 0
 else:
     # Default: assume the call is the Supervisor security API POST and
     # return the canonical success shape. The bootstrap script greps
     # for "result":"ok" to decide whether to proceed.
     stdout, stderr, code = '{{"result":"ok","data":{{}}}}', '', 0
+if code == 0 and args[:2] == ['exec', 'hassio_cli'] and '"result":"ok"' in stdout \\
+        and any('protected' in a for a in args) and not state.get('__post_noop__'):
+    model['protected'] = False
+    MODEL.write_text(json.dumps(model))
 sys.stdout.write(stdout)
 sys.stderr.write(stderr)
 sys.exit(code)
@@ -238,6 +300,9 @@ sys.exit(code)
 @pytest.fixture
 def bootstrap_env(tmp_path: Path) -> dict[str, str]:
     marker = tmp_path / "marker"
+    sl = tmp_path / "fake_sleep"
+    sl.write_text(f"#!/bin/sh\necho \"$1\" >> {tmp_path}/sleeps.log\n")
+    sl.chmod(0o755)
     creds_dir = tmp_path / "etc-ga"
     creds_dir.mkdir()
     creds = creds_dir / "ghcr-creds.json"
@@ -252,6 +317,12 @@ def bootstrap_env(tmp_path: Path) -> dict[str, str]:
         "VIBE_STORE_URL": "https://example.invalid/vibe_addons",
         "GHCR_CREDS_FILE": str(creds),
         "BG_DRY_RUN": "0",
+        "SLEEP_CMD": str(tmp_path / "fake_sleep"),
+        "GM_READY_STEP_S": "0",
+        "GM_POST_STEP_S": "0",
+        "GM_START_STEP_S": "0",
+        "GM_VISIBLE_STEP_S": "0",
+        "GM_RESTART_STEP_S": "0",
         # Short backoff so the retry tests finish in seconds (production
         # is 0 10 30 60 120 240 = ~8 min budget).
         "BACKOFF_SEQUENCE": "0 0 0 0 0 0",
@@ -283,6 +354,8 @@ def run_bootstrap(fake_ha: FakeHA, fake_docker: FakeDocker,
             if log_path.exists()
             else []
         )
+        seq = fake_ha._log_path.parent / "call_sequence.log"  # type: ignore[attr-defined]
+        result.sequence = seq.read_text().splitlines() if seq.exists() else []  # type: ignore[attr-defined]
         docker_log_path = fake_docker._log_path  # type: ignore[attr-defined]
         result.docker_calls = (  # type: ignore[attr-defined]
             [json.loads(line) for line in docker_log_path.read_text().splitlines()]

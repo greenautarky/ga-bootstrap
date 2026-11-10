@@ -181,7 +181,8 @@ def test_addon_install_fails_exits_4_after_all_retries(run_bootstrap, fake_ha, b
 
 
 def test_addon_start_fails_exits_4(run_bootstrap, fake_ha, bootstrap_env):
-    fake_ha.enqueue("addons start", code=1, stderr="start failed")
+    for _ in range(3):
+        fake_ha.enqueue("addons start", code=1, stderr="start failed")
     result = run_bootstrap()
     assert result.returncode == 4
     assert not Path(bootstrap_env["MARKER"]).exists()
@@ -331,24 +332,12 @@ def test_protected_false_post_call_dispatched(
     )
 
 
-def test_protected_false_triggers_addon_restart(
-    run_bootstrap, bootstrap_env, fake_ha, fake_docker,
-):
-    """After a successful security POST the script calls
-    `ha addons restart <slug>` so the new bind config takes effect."""
+def test_protected_false_happy_path_needs_no_restart(run_bootstrap):
+    """Flag set before the first start: the first container already has the
+    socket, so no restart is needed."""
     result = run_bootstrap()
     assert result.returncode == 0, result.stderr
-    restart_calls = [c for c in result.ha_calls
-                     if len(c) >= 2 and c[0] == "addons" and c[1] == "restart"]
-    assert restart_calls, (
-        "expected ha addons restart after protected=false toggle; "
-        f"ha_calls={result.ha_calls}"
-    )
-    assert any(c[2] == "99f1cad4_ga_manager"
-               for c in restart_calls if len(c) >= 3), (
-        "restart must target ga_manager slug; "
-        f"restart_calls={restart_calls}"
-    )
+    assert not _gm_restarts(result), result.ha_calls
 
 
 def test_protected_false_logs_disabling_line(run_bootstrap, fake_docker):
@@ -362,48 +351,45 @@ def test_protected_false_logs_disabling_line(run_bootstrap, fake_docker):
     )
 
 
-def test_protected_false_api_failure_is_non_fatal(
+def test_protected_false_api_failure_never_starts_and_exits_9(
     run_bootstrap, bootstrap_env, fake_ha, fake_docker,
 ):
-    """If the Supervisor security API returns non-ok (e.g. 401/500),
-    the script logs a WARN and continues — the addon will still run,
-    it just won't be able to do `docker exec hassio_cli ha addons update`.
-    Marker must still be written so the device boots up usable."""
-    fake_docker.enqueue(
-        "exec hassio_cli",
-        stdout='{"result":"error","message":"forced for test"}',
-        code=0,
-    )
+    """A POST that is never accepted must NOT yield a protected container:
+    no `addons start`, nonzero exit (systemd retries), no marker."""
+    for _ in range(3):
+        fake_docker.enqueue(
+            "exec hassio_cli",
+            stdout='{"result":"error","message":"forced for test"}',
+            code=0,
+        )
+    result = run_bootstrap()
+    assert result.returncode == 9, result.stdout + result.stderr
+    assert not Path(bootstrap_env["MARKER"]).exists()
+    assert not [c for c in result.ha_calls if c[:2] == ["addons", "start"]]
+    assert "ERROR: could not disable protected mode" in result.stdout + result.stderr
+
+
+def test_protected_false_post_retried_then_accepted(run_bootstrap, fake_docker):
+    fake_docker.enqueue("exec hassio_cli", stdout='{"result":"error"}', code=0)
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(_security_posts(result)) == 2
+
+
+def test_protected_false_post_happens_before_first_start(run_bootstrap):
+    """Ordering invariant (call order across both shims): install, then the
+    security POST, then the FIRST `addons start`; the HA Core wait last."""
     result = run_bootstrap()
     assert result.returncode == 0, result.stderr
-    assert Path(bootstrap_env["MARKER"]).is_file()
-    out = result.stdout + result.stderr
-    assert "could not disable protected mode" in out, (
-        f"expected WARN about failed protected=false toggle; got: {out}"
-    )
-
-
-def test_protected_false_runs_after_addon_start_before_core_wait(
-    run_bootstrap, fake_ha, fake_docker,
-):
-    """Ordering invariant: protected=false toggle MUST happen
-    AFTER ga_manager start (= so we have a running container to
-    restart) and BEFORE the HA Core ready wait (= so any subsequent
-    self-update path Core kicks off finds the addon properly bound)."""
-    result = run_bootstrap()
-    assert result.returncode == 0
+    seq = result.sequence
+    post = next(i for i, ln in enumerate(seq) if ln.startswith("docker exec hassio_cli"))
+    start = next(i for i, ln in enumerate(seq) if ln.startswith("ha addons start"))
+    install = next(i for i, ln in enumerate(seq) if ln.startswith("ha addons install"))
+    core = next(i for i, ln in enumerate(seq) if ln.startswith("ha core info"))
+    assert install < post < start < core, seq
+    assert seq.count("ha addons start 99f1cad4_ga_manager") == 1, seq
     out = result.stdout
-    # Find log-line indices for the three milestones
-    start_idx = out.find("starting 99f1cad4_ga_manager")
-    protect_idx = out.find("disabling protected mode")
-    core_idx = out.find("HA Core")
-    assert start_idx >= 0, f"missing 'starting' log; out={out}"
-    assert protect_idx >= 0, f"missing 'disabling protected mode' log; out={out}"
-    assert core_idx >= 0, f"missing 'HA Core' log; out={out}"
-    assert start_idx < protect_idx < core_idx, (
-        f"order broken: start={start_idx}, protect={protect_idx}, "
-        f"core={core_idx} (expected start < protect < core)"
-    )
+    assert out.find("disabling protected mode") < out.find("starting 99f1cad4_ga_manager")
 
 
 def test_protected_false_endpoint_carries_addon_slug(
@@ -575,7 +561,6 @@ def test_store_add_409_without_already_does_not_loop_and_runs_3a(
     assert Path(bootstrap_env["MARKER"]).is_file()
     assert _count(result, "store add") == 1, "must not retry a registered store"
     assert _security_posts(result), "step 3a (protected=false) must run"
-    assert any(c[:2] == ["addons", "restart"] for c in result.ha_calls)
 
 
 def test_store_add_409_with_repo_absent_is_not_treated_as_registered(
@@ -617,7 +602,7 @@ def test_unexpected_store_add_error_is_loud(run_bootstrap, fake_ha, bootstrap_en
     assert "kaboom" in out
 
 
-_INSPECT = "inspect addon_99f1cad4_ga_manager"
+_INSPECT = "inspect app_99f1cad4_ga_manager"
 _MOUNTS_NO_SOCK = "/data\n/config\n/share\n"
 _MOUNTS_SOCK = "/data\n/config\n/run/docker.sock\n"
 
@@ -650,10 +635,12 @@ def test_3a_protected_false_and_socket_bound_is_skipped(run_bootstrap, fake_ha, 
 
 
 def test_3a_protected_false_but_socket_absent_restarts_once(run_bootstrap, fake_ha, fake_docker):
-    """The rc6 end state: flag already false, container never recreated."""
+    """Flag already false, container created before it: restart, re-check."""
     _enqueue_info(fake_ha, False)
+    fake_docker.only_containers("app_99f1cad4_ga_manager")
     fake_docker.enqueue(_INSPECT, stdout=_MOUNTS_NO_SOCK)
-    result = run_bootstrap()
+    fake_docker.enqueue(_INSPECT, stdout=_MOUNTS_SOCK)
+    result = run_bootstrap(GM_RESTART_STEP_S="0")
     assert result.returncode == 0, result.stdout + result.stderr
     assert len(_gm_restarts(result)) == 1
     assert not _security_posts(result), "flag is already false: no second flip"
@@ -669,14 +656,14 @@ def test_3a_protected_false_old_style_var_run_socket_counts_as_bound(
     assert not _gm_restarts(result)
 
 
-def test_3a_protected_false_uninspectable_container_does_not_restart_but_warns(
+def test_3a_container_found_but_uninspectable_is_loud_exit_6(
         run_bootstrap, fake_ha, fake_docker):
     _enqueue_info(fake_ha, False)
-    fake_docker.enqueue(_INSPECT, stderr="Error: No such object", code=1)
+    fake_docker.enqueue(_INSPECT, stderr="Error: boom", code=1)
     result = run_bootstrap()
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode == 6, result.stdout + result.stderr
+    assert "ERROR: cannot inspect" in result.stdout + result.stderr
     assert not _gm_restarts(result)
-    assert "cannot inspect" in result.stdout + result.stderr
 
 
 def test_3a_runs_when_protected_true(run_bootstrap, fake_ha, bootstrap_env):
@@ -684,7 +671,165 @@ def test_3a_runs_when_protected_true(run_bootstrap, fake_ha, bootstrap_env):
     result = run_bootstrap()
     assert result.returncode == 0, result.stdout + result.stderr
     assert _security_posts(result)
-    assert len(_gm_restarts(result)) == 1, "flip + exactly one restart"
+    assert not _gm_restarts(result), "flag set before first start: no restart"
+
+
+# --- Supervisor 2026.10 names add-on containers app_<slug> (K31, rc8) ------
+
+def test_app_only_docker_unbound_socket_restarts_and_verifies(
+        run_bootstrap, fake_ha, fake_docker):
+    """Shim knows ONLY app_<slug>. Old code inspected addon_<slug>, got
+    'unknown', never restarted. New code must find app_, restart, re-check."""
+    fake_docker.only_containers("app_99f1cad4_ga_manager")
+    fake_docker.enqueue(_INSPECT, stdout=_MOUNTS_NO_SOCK)
+    fake_docker.enqueue(_INSPECT, stdout=_MOUNTS_SOCK)
+    result = run_bootstrap(GM_RESTART_STEP_S="0")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(_gm_restarts(result)) == 1
+    assert "docker.sock bound after restart" in result.stdout + result.stderr
+    inspects = [c for c in result.docker_calls if c[:1] == ["inspect"]]
+    assert inspects and all(c[1] == "app_99f1cad4_ga_manager" for c in inspects)
+
+
+def test_old_supervisor_addon_prefix_still_resolves(run_bootstrap, fake_ha, fake_docker):
+    fake_docker.only_containers("addon_99f1cad4_ga_manager")
+    fake_docker.enqueue("inspect addon_99f1cad4_ga_manager", stdout=_MOUNTS_NO_SOCK)
+    fake_docker.enqueue("inspect addon_99f1cad4_ga_manager", stdout=_MOUNTS_SOCK)
+    result = run_bootstrap(GM_RESTART_STEP_S="0")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(_gm_restarts(result)) == 1
+
+
+def test_restart_retried_on_not_ready_then_succeeds(run_bootstrap, fake_ha, fake_docker):
+    fake_docker.only_containers("app_99f1cad4_ga_manager")
+    fake_docker.enqueue(_INSPECT, stdout=_MOUNTS_NO_SOCK)
+    fake_docker.enqueue(_INSPECT, stdout=_MOUNTS_SOCK)
+    for _ in range(2):
+        fake_ha.enqueue("addons restart", code=1,
+                        stderr="Error: Supervisor is not ready (status: 503)")
+    result = run_bootstrap(GM_RESTART_STEP_S="0")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(_gm_restarts(result)) == 3
+    assert "attempt 1/" in result.stdout + result.stderr
+
+
+def test_restart_never_succeeds_is_loud_exit_7(run_bootstrap, fake_ha, fake_docker):
+    fake_docker.only_containers("app_99f1cad4_ga_manager")
+    fake_docker.enqueue(_INSPECT, stdout=_MOUNTS_NO_SOCK)
+    for _ in range(10):
+        fake_ha.enqueue("addons restart", stderr="not ready", code=1)
+    result = run_bootstrap(GM_RESTART_STEP_S="0")
+    assert result.returncode == 7, result.stdout + result.stderr
+    assert "ERROR: restart of 99f1cad4_ga_manager never succeeded" in result.stdout + result.stderr
+
+
+def test_socket_still_unbound_after_restart_is_loud_exit_7(run_bootstrap, fake_ha, fake_docker):
+    fake_docker.only_containers("app_99f1cad4_ga_manager")
+    fake_docker.enqueue(_INSPECT, stdout=_MOUNTS_NO_SOCK)
+    fake_docker.enqueue(_INSPECT, stdout=_MOUNTS_NO_SOCK)
+    result = run_bootstrap(GM_RESTART_STEP_S="0")
+    assert result.returncode == 7, result.stdout + result.stderr
+    assert "still not bound" in result.stdout + result.stderr
+
+
+def test_neither_container_name_resolvable_is_loud_exit_6(
+        run_bootstrap, fake_ha, fake_docker, bootstrap_env):
+    fake_docker.only_containers()
+    result = run_bootstrap()
+    assert result.returncode == 6, result.stdout + result.stderr
+    assert "ERROR: neither app_99f1cad4_ga_manager nor addon_99f1cad4_ga_manager" in (
+        result.stdout + result.stderr)
+    assert not Path(bootstrap_env["MARKER"]).exists()
+
+
+# --- readiness gate + start retry (runs 1-5 died at `ha addons start`) ------
+
+def test_start_not_ready_twice_then_ok_succeeds_in_one_run(
+        run_bootstrap, fake_ha, bootstrap_env):
+    for _ in range(2):
+        fake_ha.enqueue("addons start", code=1,
+                        stderr="Error: Supervisor is not ready (status: 503)")
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert Path(bootstrap_env["MARKER"]).is_file()
+    assert len([c for c in result.ha_calls if c[:2] == ["addons", "start"]]) == 3
+
+
+def test_ready_gate_waits_for_info_state_running_before_install_and_start(
+        run_bootstrap, fake_ha):
+    for _ in range(2):
+        fake_ha.enqueue("info", stdout='{"result":"ok","data":{"state":"startup"}}')
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    seq = result.sequence
+    first_install = next(i for i, x in enumerate(seq) if x.startswith("ha addons install"))
+    infos = [i for i, x in enumerate(seq) if x == "ha info"]
+    assert len(infos) >= 4, seq  # 3 before install (2 startup + running) + 1 before start
+    assert infos[0] < first_install and infos[2] < first_install
+    first_start = next(i for i, x in enumerate(seq) if x.startswith("ha addons start"))
+    assert any(first_install < i < first_start for i in infos), seq
+
+
+def test_never_ready_is_exit_8_without_install(run_bootstrap, fake_ha, bootstrap_env):
+    for _ in range(5):
+        fake_ha.enqueue("info", stdout='{"result":"ok","data":{"state":"startup"}}')
+    result = run_bootstrap()
+    assert result.returncode == 8, result.stdout + result.stderr
+    assert not [c for c in result.ha_calls if c[:2] == ["addons", "install"]]
+    assert not Path(bootstrap_env["MARKER"]).exists()
+
+
+def test_container_not_yet_visible_after_start_is_retried(run_bootstrap, fake_docker):
+    fake_docker.invisible_first(2)
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+# --- model: mounts depend on protected state at container creation ---------
+
+def test_protected_never_effective_leaves_socket_unbound_exit_7(
+        run_bootstrap, fake_docker, bootstrap_env):
+    """Model guard: container created while still protected, restart recreates
+    it protected again -> exit 7, no marker. This is what makes every
+    default-path test red if the script ever stops unprotecting."""
+    fake_docker.post_accepted_but_ignored()
+    result = run_bootstrap()
+    assert result.returncode == 7, result.stdout + result.stderr
+    assert not Path(bootstrap_env["MARKER"]).exists()
+
+
+def test_flag_false_but_container_predates_it_is_restarted_and_verified(
+        run_bootstrap, fake_ha, bootstrap_env):
+    _enqueue_info(fake_ha, False)
+    fake_ha.set_model(protected=False, container_sock=False)
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(_gm_restarts(result)) == 1
+    assert not _security_posts(result)
+    assert Path(bootstrap_env["MARKER"]).is_file()
+
+
+def test_unbound_socket_never_writes_marker(run_bootstrap, fake_ha, fake_docker, bootstrap_env):
+    _enqueue_info(fake_ha, False)
+    fake_ha.set_model(protected=False, container_sock=False)
+    for _ in range(3):
+        fake_docker.enqueue(_INSPECT, stdout=_MOUNTS_NO_SOCK)
+    result = run_bootstrap()
+    assert result.returncode == 7, result.stdout + result.stderr
+    assert not Path(bootstrap_env["MARKER"]).exists()
+
+
+def test_real_restart_budget_is_21_attempts_with_30s_steps(
+        run_bootstrap, fake_ha, fake_docker, tmp_path):
+    fake_docker.only_containers("app_99f1cad4_ga_manager")
+    fake_docker.enqueue(_INSPECT, stdout=_MOUNTS_NO_SOCK)
+    for _ in range(40):
+        fake_ha.enqueue("addons restart", stderr="not ready", code=1)
+    result = run_bootstrap(GM_RESTART_STEP_S="30", GM_RESTART_MAX_S="600")
+    assert result.returncode == 7, result.stdout + result.stderr
+    assert len(_gm_restarts(result)) == 21
+    sleeps = (tmp_path / "sleeps.log").read_text().split()
+    assert sleeps.count("30") == 20
 
 
 # Store source matching: case, scheme, trailing slash and ".git" are ignored.

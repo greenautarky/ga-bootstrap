@@ -22,9 +22,10 @@ _OPT_ARGS = {"--arg": 2, "--argjson": 2, "--slurpfile": 2, "--rawfile": 2,
              "--indent": 1, "-L": 1, "--seq": 0}
 _FROM_FILE = {"-f", "--from-file"}
 # pinned: real jq programs in the live script (addon_repo_present, step 1a,
-# parse check, creds host list + username + password, version, protected, state).
+# parse check, creds host list + username + password, version, protected,
+# core state, ha info state).
 # Update deliberately when a jq call is added or removed.
-EXPECTED_LIVE_PROGRAMS = 9
+EXPECTED_LIVE_PROGRAMS = 10
 TRUNCATED = "<<shell-quote-truncated-program>>"
 
 

@@ -21,10 +21,22 @@
 #   1 — Supervisor never came up within SUPERVISOR_WAIT_S seconds.
 #   2 — Adding the vibe_addons store failed (network / supervisor error).
 #   3 — Writing GHCR credentials failed.
-#   4 — `ha addons install ga_manager` failed.
+#   4 — `ha addons install ga_manager` failed, or `addons start` never
+#       succeeded within GM_START_MAX_S (retried in-run on "not ready").
 #   5 — jq itself failed while checking the store list (program error /
 #       jq not runnable / mktemp failed): a broken image, NOT retryable —
 #       distinct from 2 (store did not register after all retries).
+#   6 — ga_manager container not found under app_<slug> / addon_<slug>
+#       (also after the visibility wait), or not inspectable. Terminal.
+#   7 — docker.sock still unbound after restart, or the restart never
+#       succeeded within GM_RESTART_MAX_S. Terminal for this run; systemd
+#       retries (Restart=on-failure) and the marker is NOT written.
+#   8 — Supervisor never reported `ha info` .data.state == running within
+#       the readiness wait (before install / before first start).
+#       Transient class, retried by systemd.
+#   9 — the protected=false security POST was never accepted within
+#       GM_POST_MAX_S. ga_manager is NOT started (a protected first
+#       container would have no docker.sock). Retried by systemd.
 #
 # Env overrides (read from /etc/ga/ga-bootstrap.conf if present, then
 # from the environment — env wins):
@@ -38,6 +50,16 @@
 #   HA_CORE_WAIT_S            default 600   (HA Core cold-start can be slow)
 #   HA_CORE_POLL_INTERVAL     default 10
 #   JQ_CLI                    default jq    (path / fallback for the json parser)
+#   DOCKER_CLI                default docker
+#   SLEEP_CMD                 default sleep (test seam for the step-3 waits)
+#   BG_BUDGET_S               default 1440  (whole-run budget; every step-3
+#                              wait is cut off at start+BG_BUDGET_S, kept
+#                              below the unit's TimeoutStartSec=1500)
+#   GM_READY_WAIT_S / GM_READY_STEP_S      default 300 / 10 (ha info running)
+#   GM_POST_MAX_S / GM_POST_STEP_S         default 210 / 15 (protected POST)
+#   GM_START_MAX_S / GM_START_STEP_S       default 300 / 15 (addons start)
+#   GM_VISIBLE_WAIT_S / GM_VISIBLE_STEP_S  default 60 / 5   (container visible)
+#   GM_RESTART_MAX_S / GM_RESTART_STEP_S   default 600 / 30 (restart, 21 tries)
 #
 # Test seam: every external binary is invoked via a variable so the
 # pytest harness can replace `ha` / `docker` with a shim on $PATH and
@@ -80,6 +102,21 @@ GHCR_CREDS_FILE="${GHCR_CREDS_FILE:-/etc/ga/ghcr-creds.json}"
 SUPERVISOR_DATA_ROOTS="${SUPERVISOR_DATA_ROOTS:-/mnt/data/supervisor/apps/data /mnt/data/supervisor/addons/data}"
 HA_CLI="${HA_CLI:-ha}"
 JQ_CLI="${JQ_CLI:-jq}"
+DOCKER_CLI="${DOCKER_CLI:-docker}"
+SLEEP_CMD="${SLEEP_CMD:-sleep}"
+T0=$(date +%s)
+BG_BUDGET_S="${BG_BUDGET_S:-1440}"
+T_END=$(( T0 + BG_BUDGET_S ))
+GM_READY_WAIT_S="${GM_READY_WAIT_S:-300}"
+GM_READY_STEP_S="${GM_READY_STEP_S:-10}"
+GM_POST_MAX_S="${GM_POST_MAX_S:-210}"
+GM_POST_STEP_S="${GM_POST_STEP_S:-15}"
+GM_START_MAX_S="${GM_START_MAX_S:-300}"
+GM_START_STEP_S="${GM_START_STEP_S:-15}"
+GM_VISIBLE_WAIT_S="${GM_VISIBLE_WAIT_S:-60}"
+GM_VISIBLE_STEP_S="${GM_VISIBLE_STEP_S:-5}"
+GM_RESTART_MAX_S="${GM_RESTART_MAX_S:-600}"
+GM_RESTART_STEP_S="${GM_RESTART_STEP_S:-30}"
 DRY_RUN="${BG_DRY_RUN:-0}"
 # Exponential-backoff sequence for the two retry loops (store-add +
 # addons-install). Space-separated pre-sleep seconds. Tests override
@@ -89,6 +126,48 @@ BACKOFF_SEQUENCE="${BACKOFF_SEQUENCE:-0 10 30 60 120 240}"
 
 log() { printf '[ga-bootstrap] %s\n' "$*"; }
 fail() { log "ERROR: $1"; exit "${2:-1}"; }
+
+# retry_cmd <label> <max_s> <step_s> <cmd...>
+# Runs the command up to max_s/step_s+1 times (3 when step is 0 — test
+# shortcut), sleeping step_s between tries via $SLEEP_CMD, and gives up early
+# when the whole-run deadline T_END passes. Returns 0 on first success.
+# Last output is left in $_rc_out.
+retry_cmd() {
+  _rc_label=$1; _rc_max=$2; _rc_step=$3; shift 3
+  if [ "$_rc_step" -gt 0 ]; then
+    _rc_n=$(( _rc_max / _rc_step + 1 ))
+  else
+    _rc_n=3
+  fi
+  _rc_i=0
+  while [ "$_rc_i" -lt "$_rc_n" ]; do
+    _rc_i=$(( _rc_i + 1 ))
+    if _rc_out=$("$@" 2>&1); then
+      return 0
+    fi
+    log "$_rc_label failed (attempt $_rc_i/$_rc_n): $_rc_out"
+    [ "$_rc_i" -lt "$_rc_n" ] || break
+    if [ "$(date +%s)" -ge "$T_END" ]; then
+      log "$_rc_label: whole-run budget (${BG_BUDGET_S}s) exhausted"
+      break
+    fi
+    "$SLEEP_CMD" "$_rc_step"
+  done
+  return 1
+}
+
+# Supervisor readiness is `ha info` .data.state == running. (`ha supervisor
+# info` has no state field and answers ok during startup — it gates nothing.)
+ha_state_running() {
+  _st=$("$HA_CLI" info --no-progress --raw-json 2>/dev/null \
+          | "$JQ_CLI" -r '.data.state // ""' 2>/dev/null) || return 1
+  [ "$_st" = "running" ] || { echo "state=${_st:-none}"; return 1; }
+}
+wait_ready() {
+  log "waiting for Supervisor state=running ($1, up to ${GM_READY_WAIT_S}s)"
+  retry_cmd "Supervisor readiness" "$GM_READY_WAIT_S" "$GM_READY_STEP_S" ha_state_running \
+    || fail "Supervisor never reported state=running ($1)" 8
+}
 
 # --- 0. marker check (idempotent) -------------------------------------
 if [ -f "$MARKER" ]; then
@@ -518,6 +597,7 @@ store_recovery_ladder() {
   fi
 }
 
+wait_ready "before install"
 log "installing $GA_MANAGER_SLUG — with retry"
 addon_ready=0
 for pre_sleep in $BACKOFF_SEQUENCE; do
@@ -544,94 +624,101 @@ for pre_sleep in $BACKOFF_SEQUENCE; do
 done
 [ "$addon_ready" -eq 1 ] || fail "ga_manager install failed/un-verifiable after 6 attempts (~8 min)" 4
 
-log "starting $GA_MANAGER_SLUG"
-if ! "$HA_CLI" addons start "$GA_MANAGER_SLUG"; then
-  fail "ga_manager start failed (slug=$GA_MANAGER_SLUG)" 4
-fi
-
-# --- 3a. force protected=false on ga_manager --------------------------
-# Why: Supervisor's install default is `protected=true` — a sane override
-# for community-installed addons that prevents the addon from receiving
-# the dangerous permissions its manifest declares (docker_api,
-# full_access, host_pid, privileged). For ga_manager that's WRONG: the
-# addon is operator-trusted (= part of the OS image), and it NEEDS
-# docker_api access so its self-update path can run
-# `docker exec hassio_cli ha addons update <slug>` against the host
-# Docker daemon. Without protected=false the docker.sock bind is silently
-# omitted; later `docker exec hassio_cli ha addons update <slug>` fails
-# with "Cannot connect to Docker daemon".
+# --- 3a. force protected=false on ga_manager (BEFORE the first start) --
+# Why: Supervisor's install default is `protected=true`, which silently
+# omits the docker.sock bind that ga_manager's self-update path needs
+# (`docker exec hassio_cli ha addons update <slug>`; see ha-operating-system
+# memory:bug_k49_supervisor_docker_sock_missing). ga_manager is part of the
+# OS image, so it is operator-trusted.
 #
-# Discovered 2026-06-22 when K49's fleet-manager-dispatched addon-update
-# jobs broke + a fleet sweep found K31 (= just-reflashed) also had the
-# bug. K0/K6/K7/K10/K17 had been operator-toggled manually long ago.
-# See ha-operating-system memory:bug_k49_supervisor_docker_sock_missing
-# and todo_ga_bootstrap_force_protected_false_2026_06_22.
+# ORDER MATTERS: container mounts are fixed at container CREATION. The flag
+# is therefore set after install and BEFORE the first `addons start`, so the
+# first container already gets the bind. A POST that is never accepted means
+# NO start (exit 9): starting would create a protected container that only a
+# later recreate can fix.
 #
-# Best-effort: if the API call fails, log + continue. The addon will run
-# but its self-update path will be broken until an operator fixes it.
-# Idempotent, but NOT "protected=false means done": the flag says what the
-# NEXT container creation will do, not what the RUNNING container got. The rc6
-# end state was protected=false with no docker.sock bound (flag flipped, add-on
-# never recreated). So when the flag is already false the socket is checked on
-# the running container, and a restart happens if it is absent. At most ONE
-# restart per run either way ($_gm_restarted).
+# The socket is ALWAYS verified after start (also when the flag was already
+# false: the container may predate it). Unbound -> bounded restart retry ->
+# re-check; still unbound -> exit 7, marker never written.
 #
-# Socket signal: `docker inspect` of the add-on's container (addon_<slug>),
-# its .Mounts destinations. Supervisor binds the host Docker socket into an
-# add-on that declares docker_api and is not protected, at /run/docker.sock
-# (older images: /var/run/docker.sock); ga_manager's own interface_check looks
-# at both paths. Mount destination (not a host-side path probe) is the one
-# signal the host can read without entering the container. Unknown (inspect
-# fails: container missing) = no restart from here; ga_manager's own startup
-# guard (docker_socket_guard) covers that case.
-_gm_restarted=0
+# Container name: Supervisor 2026.10+ names add-on containers app_<slug>,
+# older ones addon_<slug>. gm_container resolves app_ first, then addon_.
+gm_container() {
+  for _n in "app_${GA_MANAGER_SLUG}" "addon_${GA_MANAGER_SLUG}"; do
+    if "$DOCKER_CLI" container inspect --format '{{.Id}}' "$_n" >/dev/null 2>&1; then
+      echo "$_n"
+      return 0
+    fi
+  done
+  return 1
+}
 gm_docker_sock_state() {
+  _cn=$(gm_container) || { echo nocontainer; return 0; }
   mounts=""
-  mounts=$(docker inspect "addon_${GA_MANAGER_SLUG}" \
+  mounts=$("$DOCKER_CLI" inspect "$_cn" \
              --format '{{range .Mounts}}{{println .Destination}}{{end}}' 2>/dev/null) \
-    || { echo unknown; return 0; }
+    || { echo uninspectable; return 0; }
   if printf '%s\n' "$mounts" | grep -qxE '/(var/)?run/docker\.sock'; then
     echo present
   else
     echo absent
   fi
 }
-_prot=$("$HA_CLI" addons info "$GA_MANAGER_SLUG" --no-progress --raw-json 2>/dev/null \
-        | "$JQ_CLI" -r '(if .data.protected != null then .data.protected else .protected end | if . == null then "unknown" else tostring end)' 2>/dev/null || true)
-if [ "$_prot" = "false" ]; then
-  _sock=$(gm_docker_sock_state)
-  case "$_sock" in
-    present)
-      log "$GA_MANAGER_SLUG already has protected=false and docker.sock is bound — step 3a not needed"
-      ;;
-    absent)
-      log "WARN: $GA_MANAGER_SLUG has protected=false but NO docker.sock bound (flag flipped, container never recreated) — restarting it once"
-      if [ "$_gm_restarted" -eq 0 ]; then
-        _gm_restarted=1
-        "$HA_CLI" addons restart "$GA_MANAGER_SLUG" >/dev/null 2>&1 || \
-          log "WARN: restart of $GA_MANAGER_SLUG (docker.sock missing) failed — ga_manager's own startup guard retries"
-      fi
-      ;;
-    *)
-      log "WARN: protected=false but cannot inspect addon_${GA_MANAGER_SLUG} to see whether docker.sock is bound — not restarting from here (ga_manager's startup guard covers it)"
-      ;;
-  esac
-else
-  log "disabling protected mode on $GA_MANAGER_SLUG (= enables docker_api self-update path)"
-  if docker exec hassio_cli sh -c 'wget -qO- \
+gm_post_unprotect() {
+  # The $SUPERVISOR_TOKEN in the single-quoted sh -c body expands inside hassio_cli.
+  # shellcheck disable=SC2016
+  "$DOCKER_CLI" exec hassio_cli sh -c 'wget -qO- \
       --header="Authorization: Bearer $SUPERVISOR_TOKEN" \
       --header="Content-Type: application/json" \
       --post-data="{\"protected\": false}" \
       "http://supervisor/addons/'"$GA_MANAGER_SLUG"'/security"' \
-      2>/dev/null | grep -q '"result":"ok"'; then
-    log "protected=false applied — restarting $GA_MANAGER_SLUG to pick up correct binds"
-    _gm_restarted=1
-    "$HA_CLI" addons restart "$GA_MANAGER_SLUG" >/dev/null 2>&1 || \
-      log "WARN: restart after protected=false toggle failed — addon will pick up on next manual restart"
-  else
-    log "WARN: could not disable protected mode on $GA_MANAGER_SLUG — fleet-manager-dispatched addon-update jobs will fail until an operator fixes this manually (see ha-operating-system memory:bug_k49_supervisor_docker_sock_missing_2026_06_21)"
-  fi
+      2>/dev/null | grep -q '"result":"ok"'
+}
+_prot=$("$HA_CLI" addons info "$GA_MANAGER_SLUG" --no-progress --raw-json 2>/dev/null \
+        | "$JQ_CLI" -r '(if .data.protected != null then .data.protected else .protected end | if . == null then "unknown" else tostring end)' 2>/dev/null || true)
+if [ "$_prot" = "false" ]; then
+  log "$GA_MANAGER_SLUG already has protected=false"
+else
+  log "disabling protected mode on $GA_MANAGER_SLUG before its first start (= enables docker_api self-update path)"
+  retry_cmd "protected=false POST" "$GM_POST_MAX_S" "$GM_POST_STEP_S" gm_post_unprotect \
+    || fail "could not disable protected mode on $GA_MANAGER_SLUG within ${GM_POST_MAX_S}s — NOT starting it (a protected container would have no docker.sock); systemd retries" 9
+  log "protected=false applied"
 fi
+
+wait_ready "before first start"
+log "starting $GA_MANAGER_SLUG"
+retry_cmd "ga_manager start" "$GM_START_MAX_S" "$GM_START_STEP_S" \
+    "$HA_CLI" addons start "$GA_MANAGER_SLUG" \
+  || fail "ga_manager start failed (slug=$GA_MANAGER_SLUG) within ${GM_START_MAX_S}s" 4
+
+# --- 3a'. verify docker.sock on the running container (always) ---------
+# A container that is not visible yet right after start is transient.
+retry_cmd "container visibility" "$GM_VISIBLE_WAIT_S" "$GM_VISIBLE_STEP_S" gm_container || true
+_sock=$(gm_docker_sock_state)
+case "$_sock" in
+  present)
+    log "$GA_MANAGER_SLUG: docker.sock is bound — step 3a verified"
+    ;;
+  nocontainer)
+    fail "neither app_${GA_MANAGER_SLUG} nor addon_${GA_MANAGER_SLUG} exists after start (waited ${GM_VISIBLE_WAIT_S}s) — cannot verify docker.sock" 6
+    ;;
+  uninspectable)
+    fail "cannot inspect the $GA_MANAGER_SLUG container to verify docker.sock" 6
+    ;;
+  *)
+    log "WARN: $GA_MANAGER_SLUG has NO docker.sock bound (container created before protected=false) — restarting it (retry while Supervisor is not ready)"
+    retry_cmd "restart of $GA_MANAGER_SLUG" "$GM_RESTART_MAX_S" "$GM_RESTART_STEP_S" \
+        "$HA_CLI" addons restart "$GA_MANAGER_SLUG" \
+      || fail "restart of $GA_MANAGER_SLUG never succeeded within ${GM_RESTART_MAX_S}s — docker.sock stays unbound" 7
+    retry_cmd "container visibility" "$GM_VISIBLE_WAIT_S" "$GM_VISIBLE_STEP_S" gm_container || true
+    _sock=$(gm_docker_sock_state)
+    if [ "$_sock" = "present" ]; then
+      log "$GA_MANAGER_SLUG: docker.sock bound after restart"
+    else
+      fail "$GA_MANAGER_SLUG restarted but docker.sock is still not bound (state=$_sock)" 7
+    fi
+    ;;
+esac
 
 # --- 4a. wait for HA Core ready ---------------------------------------
 # Absorbs ga-ha-init's wait. We want ga-bootstrap to exit only once
@@ -642,6 +729,8 @@ fi
 # on this same wait — converge keeps an eye on Core health after that.
 log "waiting for HA Core to report state=running (up to ${HA_CORE_WAIT_S}s)"
 deadline=$(( $(date +%s) + HA_CORE_WAIT_S ))
+# Best-effort wait must not push the run past the unit timeout.
+[ "$deadline" -le "$T_END" ] || deadline=$T_END
 while :; do
   state=$("$HA_CLI" core info --no-progress --raw-json 2>/dev/null \
             | "$JQ_CLI" -r '.data.state // ""' 2>/dev/null || true)
