@@ -181,11 +181,19 @@ wait_ready() {
 # `ha store reload` makes Supervisor ls-remote+fetch every registered repo
 # anonymously; repeated reloads on first boot cause HTTP 429 / "store.git:
 # already a task in progress" (Odoo #1752). So: never a readiness probe, never
-# in a retry loop. At most STORE_RELOAD_MAX (2) per run: the first one only
-# after state=running, a second one (recovery ladder) only after a logged
-# backoff of STORE_RELOAD_BACKOFF_S (>= 60 s) via $SLEEP_CMD.
+# in a retry loop, and NOT after `store add` (add itself clones/fetches). Only
+# the recovery ladder reloads: at most STORE_RELOAD_MAX (1) per run, after
+# state=running and a logged backoff of STORE_RELOAD_BACKOFF_S (60 s).
+# Plain backoff sleeps are capped against the whole-run deadline T_END.
+# Returns 1 when the budget is exhausted (callers stop retrying).
+bg_sleep() {
+  _bs_left=$(( T_END - $(date +%s) ))
+  [ "$_bs_left" -gt 0 ] || return 1
+  [ "$1" -le "$_bs_left" ] || set -- "$_bs_left"
+  "$SLEEP_CMD" "$1"
+}
 STORE_RELOAD_COUNT=0
-STORE_RELOAD_MAX="${STORE_RELOAD_MAX:-2}"
+STORE_RELOAD_MAX="${STORE_RELOAD_MAX:-1}"
 STORE_RELOAD_BACKOFF_S="${STORE_RELOAD_BACKOFF_S:-60}"
 store_reload() {
   if [ "$STORE_RELOAD_COUNT" -ge "$STORE_RELOAD_MAX" ]; then
@@ -193,10 +201,8 @@ store_reload() {
     return 1
   fi
   wait_ready "before store reload ($1)"
-  if [ "$STORE_RELOAD_COUNT" -gt 0 ]; then
-    log "store reload ($1): backing off ${STORE_RELOAD_BACKOFF_S}s after the previous reload (429 guard)"
-    "$SLEEP_CMD" "$STORE_RELOAD_BACKOFF_S"
-  fi
+  log "store reload ($1): backing off ${STORE_RELOAD_BACKOFF_S}s first (429 guard)"
+  bg_sleep "$STORE_RELOAD_BACKOFF_S" || true
   STORE_RELOAD_COUNT=$(( STORE_RELOAD_COUNT + 1 ))
   log "store reload #$STORE_RELOAD_COUNT ($1)"
   "$HA_CLI" store reload --no-progress >/dev/null 2>&1
@@ -209,20 +215,11 @@ if [ -f "$MARKER" ]; then
 fi
 
 # --- 1. wait for supervisor -------------------------------------------
-log "waiting for Supervisor (up to ${SUPERVISOR_WAIT_S}s)"
-deadline=$(( $(date +%s) + SUPERVISOR_WAIT_S ))
-sup_info=""
-while :; do
-  sup_info=$("$HA_CLI" supervisor info --raw-json 2>/dev/null || true)
-  if printf '%s' "$sup_info" | grep -q '"result":"ok"'; then
-    log "Supervisor ready"
-    break
-  fi
-  if [ "$(date +%s)" -ge "$deadline" ]; then
-    fail "Supervisor never reported ok within ${SUPERVISOR_WAIT_S}s" 1
-  fi
-  sleep "$SUPERVISOR_POLL_INTERVAL"
-done
+# `ha supervisor info` answers result=ok DURING startup, so it gates nothing:
+# readiness is `ha info` state==running (shared budget), before any store work.
+wait_ready "before store add"
+log "Supervisor ready"
+sup_info=$("$HA_CLI" supervisor info --raw-json 2>/dev/null || true)
 
 # --- 1a. disable Supervisor auto-update -------------------------------
 # Why: fleet devices must not auto-update Supervisor — the rollout is
@@ -376,7 +373,7 @@ store_added=0
 for pre_sleep in $BACKOFF_SEQUENCE; do
   if [ "$pre_sleep" -gt 0 ]; then
     log "waiting ${pre_sleep}s before retry..."
-    sleep "$pre_sleep"
+    bg_sleep "$pre_sleep" || { log "whole-run budget (${BG_BUDGET_S}s) exhausted — no more retries"; break; }
   fi
   # Capture stderr+stdout so we can distinguish "already added" from
   # real failures. Exit code alone is insufficient — supervisor returns
@@ -405,7 +402,6 @@ for pre_sleep in $BACKOFF_SEQUENCE; do
     fi
     log "vibe_addons store registered + verified"
     store_added=1
-    store_reload "after store add" || true
     break
   elif [ "$rc" -eq 0 ]; then
     log "store add returned ok but repo not yet visible — retrying"
@@ -444,8 +440,7 @@ for pre_sleep in $BACKOFF_SEQUENCE; do
       if [ "$present_rc" -eq 0 ]; then
         log "vibe_addons store registered + verified (after lifting the condition)"
         store_added=1
-        store_reload "after store add" || true
-        break
+            break
       fi
       log "still not registered after lifting — falling through to backoff"
     else
@@ -577,17 +572,6 @@ addon_missing_from_store() {
   printf '%s' "$last_addon_info" | grep -q -i 'does not exist'
 }
 
-wait_supervisor_ready() {
-  _deadline=$(( $(date +%s) + SUPERVISOR_WAIT_S ))
-  while :; do
-    if "$HA_CLI" supervisor info --raw-json 2>/dev/null | grep -q '"result":"ok"'; then
-      return 0
-    fi
-    [ "$(date +%s)" -ge "$_deadline" ] && return 1
-    sleep "$SUPERVISOR_POLL_INTERVAL"
-  done
-}
-
 # Store-recovery ladder (Odoo #1337). Measured on a canary
 # (BOSv1.5.2-rc2, 2026-10-23): a power cut during the first store clone
 # left repository.json zero-length; Supervisor reset + re-cloned the store
@@ -616,11 +600,8 @@ store_recovery_ladder() {
   log "WARN: rung 1: $GA_MANAGER_SLUG still does not exist after store reload — rung 2: restarting Supervisor (once per run)"
   "$HA_CLI" supervisor restart --no-progress >/dev/null 2>&1 || \
     log "WARN: rung 2: supervisor restart returned non-zero (it may drop the connection) — waiting for it anyway"
-  if wait_supervisor_ready; then
-    log "WARN: rung 2: Supervisor answers again after restart"
-  else
-    log "WARN: rung 2: Supervisor did not answer within ${SUPERVISOR_WAIT_S}s after restart — continuing retries"
-  fi
+  wait_ready "after supervisor restart"
+  log "WARN: rung 2: Supervisor reports running again after restart"
   addons_installed "$GA_MANAGER_SLUG" || true
   if addon_missing_from_store; then
     log "WARN: rung 2: $GA_MANAGER_SLUG STILL does not exist after Supervisor restart — continuing install retries"
@@ -635,7 +616,7 @@ addon_ready=0
 for pre_sleep in $BACKOFF_SEQUENCE; do
   if [ "$pre_sleep" -gt 0 ]; then
     log "waiting ${pre_sleep}s before retry..."
-    sleep "$pre_sleep"
+    bg_sleep "$pre_sleep" || { log "whole-run budget (${BG_BUDGET_S}s) exhausted — no more retries"; break; }
   fi
   "$HA_CLI" addons install "$GA_MANAGER_SLUG" >/dev/null 2>&1 || true
   if addons_installed "$GA_MANAGER_SLUG"; then
@@ -759,19 +740,24 @@ esac
 # reports "running" within HA_CORE_WAIT_S we log + continue (do NOT
 # fail). The marker still gets written so a later boot isn't blocked
 # on this same wait — converge keeps an eye on Core health after that.
-log "waiting for HA Core to report state=running (up to ${HA_CORE_WAIT_S}s)"
+# Core "running" = `ha core stats` succeeds (GET /core/stats). The Supervisor's
+# /core/info has NO state field (supervisor/api/homeassistant.py info() on
+# 2025.11.4 and 2026.10.5), so the old `core info .data.state` poll could never
+# succeed and always burned the full wait ("last state=unknown", rc9 log).
+# /core/stats raises HomeAssistantNotRunningError (supervisor/homeassistant/
+# core.py stats()) when the container is absent or not running -> CLI non-zero.
+log "waiting for HA Core to be running (ha core stats, up to ${HA_CORE_WAIT_S}s)"
 deadline=$(( $(date +%s) + HA_CORE_WAIT_S ))
 # Best-effort wait must not push the run past the unit timeout.
 [ "$deadline" -le "$T_END" ] || deadline=$T_END
+core_out=""
 while :; do
-  state=$("$HA_CLI" core info --no-progress --raw-json 2>/dev/null \
-            | "$JQ_CLI" -r '.data.state // ""' 2>/dev/null || true)
-  if [ "$state" = "running" ]; then
-    log "HA Core state=running"
+  if core_out=$("$HA_CLI" core stats --no-progress --raw-json 2>&1); then
+    log "HA Core running (core stats answered)"
     break
   fi
   if [ "$(date +%s)" -ge "$deadline" ]; then
-    log "WARN: HA Core never reported running within ${HA_CORE_WAIT_S}s (last state=${state:-unknown}) — continuing"
+    log "WARN: HA Core never reported running within ${HA_CORE_WAIT_S}s (last core stats: ${core_out:-no output}) — continuing"
     break
   fi
   sleep "$HA_CORE_POLL_INTERVAL"

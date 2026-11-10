@@ -126,6 +126,8 @@ else:
         stdout, stderr, code = '{{"result":"ok","data":{{"auto_update":false}}}}', '', 0
     elif key == 'supervisor options':
         stdout, stderr, code = '', '', 0
+    elif key == 'core stats':
+        stdout, stderr, code = '{{"result":"ok","data":{{"cpu_percent":1.0}}}}', '', 0
     elif key == 'core info':
         stdout, stderr, code = '{{"result":"ok","data":{{"state":"running"}}}}', '', 0
     elif key == 'info':

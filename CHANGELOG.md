@@ -8,9 +8,20 @@ on boot 2 (store sync); bootstrap exited 8, the 180 s systemd restart gap pushed
 gm-up to ~22 min after power-on.
 
 After:
-- `GM_READY_WAIT_S` default 600 (moderate). The two waits (before install,
-  before first start) share ONE budget: the second only gets what the first
-  left, so a run never spends 2x600 s. Still capped by BG_BUDGET_S.
+- `GM_READY_WAIT_S` default 600 (moderate). ALL readiness waits (before
+  store add, before the recovery-ladder reload, after a ladder Supervisor
+  restart, before install, before first start) share ONE budget: each only gets
+  what the earlier ones left, so a run never spends 2x600 s. Capped by BG_BUDGET_S.
+- Step 1 no longer gates on `ha supervisor info` result=ok (it answers during
+  startup); it waits for `ha info` state==running BEFORE `store add`.
+- Backoff sleeps in the store-add and install loops go through `bg_sleep`,
+  capped against the whole-run deadline T_END (loops stop when exhausted).
+- Step 4a: HA Core "running" = `ha core stats` succeeds. `/core/info` has no
+  state field (supervisor/api/homeassistant.py info() on 2025.11.4 and
+  2026.10.5), so the old poll always timed out ("last state=unknown").
+  `/core/stats` raises HomeAssistantNotRunningError when the container is not
+  running (supervisor/homeassistant/core.py stats()). The WARN now carries the
+  last output.
 - Timing budget (seconds), whole run <= BG_BUDGET_S=1440 < TimeoutStartSec=1500:
 
   | wait                         | before | now                  |
@@ -27,12 +38,11 @@ After:
   StartLimitBurst=10 (was 480 s cycle, <= 7/h).
 - `ha store reload` rate limit (Odoo #1752; GitHub 429 / "store.git: already a
   task in progress" on first boot): reload is no readiness probe and no longer
-  runs before every `store add` retry. `store_reload` runs it after
-  state=running, at most STORE_RELOAD_MAX=2 per run, the second (recovery
-  ladder) only after a logged STORE_RELOAD_BACKOFF_S=60 s backoff. Reload
-  calls per first-boot run, before -> after: happy path 1 -> 1; with 3 failed
-  `store add` retries 4 -> 1; with the recovery ladder 2 -> 2 (now with 60 s
-  gap).
+  runs before every `store add` retry, nor after a successful add (add itself
+  clones/fetches). Only the recovery ladder reloads: `store_reload`, after
+  state=running and a logged STORE_RELOAD_BACKOFF_S=60 s, at most
+  STORE_RELOAD_MAX=1 per run. Reload calls per first-boot run, before ->
+  after: happy path 1 -> 0; 3 failed `store add` retries 4 -> 0; ladder 2 -> 1.
 - Tests: 480 s startup then running succeeds; startup past 600 s -> exit 8;
   two waits together sleep exactly 600 s at most.
 

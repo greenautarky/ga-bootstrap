@@ -31,7 +31,7 @@ def test_happy_path_writes_marker_and_calls_expected_commands(run_bootstrap, boo
     registry_idx = next(i for i, s in enumerate(flat) if "docker registries" in s)
     install_idx = next(i for i, s in enumerate(flat) if "addons install" in s)
     start_idx = next(i for i, s in enumerate(flat) if "addons start" in s)
-    core_idx = next(i for i, s in enumerate(flat) if "core info" in s)
+    core_idx = next(i for i, s in enumerate(flat) if "core stats" in s)
     assert sup_idx < store_idx < registry_idx < install_idx < start_idx < core_idx
 
 
@@ -44,22 +44,19 @@ def test_marker_present_short_circuits_with_zero_calls(run_bootstrap, bootstrap_
     assert Path(bootstrap_env["MARKER"]).read_text() == "already done\n"
 
 
-def test_supervisor_never_ready_exits_1(run_bootstrap, fake_ha):
-    # Queue 10 empty responses — wait deadline (5s with 1s poll) hits before then
+def test_supervisor_never_ready_exits_8(run_bootstrap, fake_ha):
     for _ in range(10):
-        fake_ha.enqueue("supervisor info", stdout="", code=0)
+        fake_ha.enqueue("info", stdout='{"result":"ok","data":{"state":"startup"}}')
     result = run_bootstrap()
-    assert result.returncode == 1, (
-        f"expected exit 1, got {result.returncode}; stderr={result.stderr}"
-    )
-    assert "Supervisor never reported ok" in result.stdout + result.stderr
+    assert result.returncode == 8, result.stdout + result.stderr
+    assert "Supervisor never reported state=running (before store add)" in (
+        result.stdout + result.stderr)
+    assert not [c for c in result.ha_calls if c[:2] == ["store", "add"]]
 
 
 def test_supervisor_eventually_ready_succeeds(run_bootstrap, fake_ha, bootstrap_env):
-    # First 2 polls return nothing, 3rd returns ok
-    fake_ha.enqueue("supervisor info", stdout="", code=0)
-    fake_ha.enqueue("supervisor info", stdout="", code=0)
-    fake_ha.enqueue("supervisor info", stdout='{"result":"ok"}', code=0)
+    for _ in range(2):
+        fake_ha.enqueue("info", stdout='{"result":"ok","data":{"state":"startup"}}')
     result = run_bootstrap()
     assert result.returncode == 0, result.stderr
     assert Path(bootstrap_env["MARKER"]).is_file()
@@ -261,41 +258,47 @@ def test_auto_update_options_failure_is_non_fatal(run_bootstrap, fake_ha, bootst
 # --- Step 6: wait for HA Core ready -----------------------------------
 
 
-def test_core_ready_immediately_writes_marker(run_bootstrap, bootstrap_env):
-    """Default core info returns state=running on the first poll — marker written."""
+_CORE_INFO_REAL = ('{"result":"ok","data":{"version":"2026.10.5","version_latest":'
+                   '"2026.10.5","arch":"aarch64","image":"x","machine":"y"}}')  # NO state key
+
+
+def _core_stats_calls(result):
+    return [c for c in result.ha_calls if c[:2] == ["core", "stats"]]
+
+
+def test_core_ready_immediately_writes_marker(run_bootstrap, fake_ha, bootstrap_env):
+    """Real /core/info shape has no state key; readiness is `core stats`.
+    Red on old code: it polled core info .data.state, never saw running."""
+    for _ in range(10):
+        fake_ha.enqueue("core info", stdout=_CORE_INFO_REAL)
     result = run_bootstrap()
     assert result.returncode == 0, result.stderr
     assert Path(bootstrap_env["MARKER"]).is_file()
-    core_calls = [c for c in result.ha_calls if "core" in c and "info" in c]
-    # At least one core info call; in the happy path exactly one (returns running first try).
-    assert len(core_calls) >= 1
+    assert len(_core_stats_calls(result)) == 1
+    assert "never reported running" not in result.stdout + result.stderr
 
 
-def test_core_never_ready_still_writes_marker_with_warning(
+def test_core_never_ready_still_writes_marker_with_loud_warning(
     run_bootstrap, fake_ha, bootstrap_env
 ):
-    """Step 6 is best-effort — if Core never reports running we log a
-    WARN and continue. Marker MUST still be written so future boots
-    aren't blocked on the same wait."""
-    # Queue 10 non-running responses so the deadline (5 s @ 1 s poll) hits first.
+    """Best-effort: if Core never runs we log a WARN (with the last output) and
+    continue; the marker is still written."""
     for _ in range(10):
-        fake_ha.enqueue("core info", stdout='{"result":"ok","data":{"state":"starting"}}', code=0)
+        fake_ha.enqueue("core stats", stderr="Error: Home Assistant is not running", code=1)
     result = run_bootstrap()
     assert result.returncode == 0, result.stderr
     assert Path(bootstrap_env["MARKER"]).is_file()
-    assert "HA Core never reported running" in (result.stdout + result.stderr)
+    out = result.stdout + result.stderr
+    assert "HA Core never reported running" in out and "not running" in out
 
 
 def test_core_eventually_ready_succeeds(run_bootstrap, fake_ha, bootstrap_env):
-    """3 polls returning 'starting' then one returning 'running' — marker written."""
-    fake_ha.enqueue("core info", stdout='{"result":"ok","data":{"state":"starting"}}', code=0)
-    fake_ha.enqueue("core info", stdout='{"result":"ok","data":{"state":"starting"}}', code=0)
-    fake_ha.enqueue("core info", stdout='{"result":"ok","data":{"state":"running"}}', code=0)
+    for _ in range(2):
+        fake_ha.enqueue("core stats", stderr="Error: not running", code=1)
     result = run_bootstrap()
     assert result.returncode == 0, result.stderr
     assert Path(bootstrap_env["MARKER"]).is_file()
-    core_calls = [c for c in result.ha_calls if "core" in c and "info" in c]
-    assert len(core_calls) >= 3
+    assert len(_core_stats_calls(result)) == 3
 
 
 # ─── v1.2.8: force protected=false on ga_manager addon ───────────────
@@ -385,7 +388,7 @@ def test_protected_false_post_happens_before_first_start(run_bootstrap):
     post = next(i for i, ln in enumerate(seq) if ln.startswith("docker exec hassio_cli"))
     start = next(i for i, ln in enumerate(seq) if ln.startswith("ha addons start"))
     install = next(i for i, ln in enumerate(seq) if ln.startswith("ha addons install"))
-    core = next(i for i, ln in enumerate(seq) if ln.startswith("ha core info"))
+    core = next(i for i, ln in enumerate(seq) if ln.startswith("ha core stats"))
     assert install < post < start < core, seq
     assert seq.count("ha addons start 99f1cad4_ga_manager") == 1, seq
     out = result.stdout
@@ -500,8 +503,8 @@ def test_addon_present_first_try_no_reload_no_restart(run_bootstrap, fake_ha):
     assert result.returncode == 0, result.stdout
     assert _count(result, "supervisor restart") == 0
     assert "rung" not in result.stdout
-    # store reload only from step 2's post-register reload, never from the ladder
-    assert _count(result, "store reload") == 1
+    # no reload at all on the happy path (Odoo #1752): `store add` itself fetches
+    assert _count(result, "store reload") == 0
 
 
 def test_addon_known_but_install_failing_never_restarts(run_bootstrap, fake_ha):
@@ -925,7 +928,7 @@ def _jq_wrapper(tmp_path, rc: int, msg: str) -> str:
     w = tmp_path / "jq-broken"
     # passes the cheap `-e type` input-parse check, fails the real program
     w.write_text(
-        f"#!/bin/sh\n[ \"$2\" = type ] && exit 0\necho '{msg}' >&2\nexit {rc}\n"
+        f"#!/bin/sh\n[ \"$2\" = type ] && exit 0\ncase \"$2\" in *.data.state*) echo running; exit 0;; esac\necho '{msg}' >&2\nexit {rc}\n"
     )
     w.chmod(0o755)
     return str(w)
@@ -1060,13 +1063,13 @@ def test_two_readiness_waits_share_one_600s_budget(
 
 # --- Odoo #1752: store reload is rate-limited (GitHub 429 on first boot) ----
 
-def test_store_reload_happy_path_at_most_once(run_bootstrap):
+def test_store_reload_happy_path_zero(run_bootstrap):
     result = run_bootstrap()
     assert result.returncode == 0, result.stdout + result.stderr
-    assert _count(result, "store reload") <= 1
+    assert _count(result, "store reload") == 0
 
 
-def test_store_reload_with_store_add_retries_at_most_once(run_bootstrap, fake_ha):
+def test_store_reload_with_store_add_retries_zero(run_bootstrap, fake_ha):
     """Old code reloaded before EVERY backoff retry of `store add`."""
     for _ in range(3):
         fake_ha.enqueue("store add", code=1, stderr="Error: clone failed")
@@ -1074,15 +1077,52 @@ def test_store_reload_with_store_add_retries_at_most_once(run_bootstrap, fake_ha
                         stdout='{"result":"ok","data":{"repositories":[]}}')
     result = run_bootstrap(BACKOFF_SEQUENCE="0 1 1 1 1")
     assert result.returncode == 0, result.stdout + result.stderr
-    assert _count(result, "store reload") <= 1
+    assert _count(result, "store reload") == 0
 
 
-def test_store_reload_with_ladder_at_most_twice_with_logged_backoff(
+def test_store_reload_worst_case_once_with_logged_backoff(
         run_bootstrap, fake_ha, bootstrap_env):
     fake_ha.addon_missing("always")
     result = run_bootstrap(STORE_RELOAD_BACKOFF_S="77")
     assert result.returncode == 4
-    assert _count(result, "store reload") == 2, result.stdout
+    assert _count(result, "store reload") == 1, result.stdout
     assert "backing off 77s" in result.stdout + result.stderr
     sleeps = (Path(bootstrap_env["SLEEP_CMD"]).parent / "sleeps.log").read_text().split()
     assert "77" in sleeps
+
+
+def test_nothing_touches_the_store_before_info_reports_running(run_bootstrap, fake_ha):
+    """Supervisor startup,startup,running: no `store add`/`store reload` before
+    the THIRD `ha info` call; the whole first boot succeeds in one run."""
+    for _ in range(2):
+        fake_ha.enqueue("info", stdout='{"result":"ok","data":{"state":"startup"}}')
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    seq = result.sequence
+    third_info = [i for i, x in enumerate(seq) if x == "ha info"][2]
+    store = [i for i, x in enumerate(seq) if "store add" in x or "store reload" in x]
+    assert store and min(store) > third_info, seq
+
+
+def test_store_add_only_after_480s_startup_in_one_run(
+        run_bootstrap, fake_ha, bootstrap_env):
+    for _ in range(48):
+        fake_ha.enqueue("info", stdout='{"result":"ok","data":{"state":"startup"}}')
+    result = run_bootstrap(GM_READY_STEP_S="10")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert Path(bootstrap_env["MARKER"]).is_file()
+    seq = result.sequence
+    last_startup_info = [i for i, x in enumerate(seq) if x == "ha info"][48]
+    assert min(i for i, x in enumerate(seq) if "store add" in x) > last_startup_info
+
+
+def test_backoff_sleeps_are_capped_by_whole_run_budget(
+        run_bootstrap, fake_ha, bootstrap_env):
+    """BG_BUDGET_S already exhausted: plain backoffs stop instead of sleeping."""
+    for _ in range(6):
+        fake_ha.enqueue("store add", code=1, stderr="clone failed")
+        fake_ha.enqueue("store repositories",
+                        stdout='{"result":"ok","data":{"repositories":[]}}')
+    result = run_bootstrap(BG_BUDGET_S="0", BACKOFF_SEQUENCE="0 30 30 30")
+    assert "whole-run budget" in result.stdout + result.stderr
+    assert _count(result, "store add") <= 2
