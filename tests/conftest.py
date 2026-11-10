@@ -65,6 +65,7 @@ class FakeHA:
 def fake_ha(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeHA:
     state_path = tmp_path / "fake_ha_state.json"
     log_path = tmp_path / "fake_ha_calls.jsonl"
+    seq_path = tmp_path / "call_sequence.log"
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     fake_path = bin_dir / "ha"
@@ -81,6 +82,8 @@ args = sys.argv[1:]
 clean = [a for a in args if not a.startswith('--')]
 key = ' '.join(clean[:2])
 LOG.write_text((LOG.read_text() if LOG.exists() else '') + json.dumps(args) + '\\n')
+with open({str(seq_path)!r}, 'a') as _f:
+    _f.write('ha ' + ' '.join(clean) + '\\n')
 state = json.loads(STATE.read_text()) if STATE.exists() else {{}}
 queue = state.get(key, [])
 flags = state.get('__flags__', {{}})
@@ -184,6 +187,12 @@ class FakeDocker:
                 stderr: str = "", code: int = 0) -> None:
         self.responses.setdefault(verb_prefix, []).append((stdout, stderr, code))
 
+    def only_containers(self, *names: str, all_names: tuple[str, ...] = (
+            "app_99f1cad4_ga_manager", "addon_99f1cad4_ga_manager")) -> None:
+        """Every container name in all_names NOT in names does not exist
+        (`docker container inspect` fails for it)."""
+        self.responses["__missing__"] = [n for n in all_names if n not in names]  # type: ignore[assignment]
+
 
 @pytest.fixture
 def fake_docker(tmp_path: Path, fake_ha: FakeHA,
@@ -194,6 +203,7 @@ def fake_docker(tmp_path: Path, fake_ha: FakeHA,
     PATH prefix."""
     state_path = tmp_path / "fake_docker_state.json"
     log_path = tmp_path / "fake_docker_calls.jsonl"
+    seq_path = tmp_path / "call_sequence.log"
     bin_dir = tmp_path / "bin"
     # bin_dir already exists from fake_ha
     fake_path = bin_dir / "docker"
@@ -207,12 +217,20 @@ args = sys.argv[1:]
 LOG.write_text((LOG.read_text() if LOG.exists() else '') + json.dumps(args) + '\\n')
 # Match on the first two args (typically "exec hassio_cli").
 key = ' '.join(args[:2])
+with open({str(seq_path)!r}, 'a') as _f:
+    _f.write('docker ' + ' '.join(args[:3]) + '\\n')
 state = json.loads(STATE.read_text()) if STATE.exists() else {{}}
 queue = state.get(key, [])
+if args[:2] == ['container', 'inspect'] and args[-1] in state.get('__missing__', []):
+    sys.stderr.write('Error: No such container: ' + args[-1])
+    sys.exit(1)
 if queue:
     stdout, stderr, code = queue[0]
     state[key] = queue[1:]
     STATE.write_text(json.dumps(state))
+elif args[:1] == ['inspect']:
+    # Default mounts of a healthy ga_manager container: socket bound.
+    stdout, stderr, code = '/data\\n/run/docker.sock\\n', '', 0
 else:
     # Default: assume the call is the Supervisor security API POST and
     # return the canonical success shape. The bootstrap script greps
@@ -283,6 +301,8 @@ def run_bootstrap(fake_ha: FakeHA, fake_docker: FakeDocker,
             if log_path.exists()
             else []
         )
+        seq = tmp_path_seq = fake_ha._log_path.parent / "call_sequence.log"  # type: ignore[attr-defined]
+        result.sequence = seq.read_text().splitlines() if seq.exists() else []  # type: ignore[attr-defined]
         docker_log_path = fake_docker._log_path  # type: ignore[attr-defined]
         result.docker_calls = (  # type: ignore[attr-defined]
             [json.loads(line) for line in docker_log_path.read_text().splitlines()]

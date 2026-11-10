@@ -1,3 +1,28 @@
+## 1.2.14 — 2026-11-10
+
+### fix: Supervisor 2026.10 `app_<slug>` containers; docker.sock bound on first start
+
+Before: Supervisor 2026.10 names add-on containers `app_<slug>` (was
+`addon_<slug>`). Step 3a inspected `addon_<slug>`, got nothing, returned
+`unknown` and only WARNed, so it never restarted. Mounts are fixed at container
+creation, and `protected=false` was set only after the first start, so the first
+container had no docker.sock; the one restart then hit Supervisor "not ready".
+(Proven on a canary, BOSv1.6.0-rc8, Supervisor 2026.10.5.3.)
+
+After:
+- `protected=false` is POSTed right after install, BEFORE the first
+  `ha addons start`, so the first container already gets the bind.
+- `gm_container` resolves `app_<slug>` first, then `addon_<slug>` (older
+  Supervisor). Its only call site is `gm_docker_sock_state` (the only former
+  `addon_` docker inspect site).
+- Step 3a is now a verification after start. Socket absent: `ha addons restart`
+  is retried (GM_RESTART_STEP_S=30 steps up to GM_RESTART_MAX_S=600) while
+  Supervisor is not ready, then the mounts are re-checked.
+- New loud exit codes: 6 = ga_manager container not found under either name (or
+  not inspectable); 7 = docker.sock still unbound after restart, or restart never
+  succeeded in the bound. If the protected=false POST itself fails, a WARN is
+  logged and verification is skipped (unchanged non-fatal behaviour).
+
 ## 1.2.13 — 2026-11-09
 
 - A store listing holding several concatenated JSON documents is a retryable WARN, not a fatal exit 5 (re-review of #11).
