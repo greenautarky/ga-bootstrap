@@ -377,10 +377,10 @@ def test_protected_false_post_happens_before_first_start(run_bootstrap):
     result = run_bootstrap()
     assert result.returncode == 0, result.stderr
     seq = result.sequence
-    post = next(i for i, l in enumerate(seq) if l.startswith("docker exec hassio_cli"))
-    start = next(i for i, l in enumerate(seq) if l.startswith("ha addons start"))
-    install = next(i for i, l in enumerate(seq) if l.startswith("ha addons install"))
-    core = next(i for i, l in enumerate(seq) if l.startswith("ha core info"))
+    post = next(i for i, ln in enumerate(seq) if ln.startswith("docker exec hassio_cli"))
+    start = next(i for i, ln in enumerate(seq) if ln.startswith("ha addons start"))
+    install = next(i for i, ln in enumerate(seq) if ln.startswith("ha addons install"))
+    core = next(i for i, ln in enumerate(seq) if ln.startswith("ha core info"))
     assert install < post < start < core, seq
     assert seq.count("ha addons start 99f1cad4_ga_manager") == 1, seq
     out = result.stdout
@@ -700,7 +700,8 @@ def test_restart_retried_on_not_ready_then_succeeds(run_bootstrap, fake_ha, fake
     fake_docker.enqueue(_INSPECT, stdout=_MOUNTS_NO_SOCK)
     fake_docker.enqueue(_INSPECT, stdout=_MOUNTS_SOCK)
     for _ in range(2):
-        fake_ha.enqueue("addons restart", stderr="Error: Supervisor is not ready (status: 503)", code=1)
+        fake_ha.enqueue("addons restart", code=1,
+                        stderr="Error: Supervisor is not ready (status: 503)")
     result = run_bootstrap(GM_RESTART_STEP_S="0")
     assert result.returncode == 0, result.stdout + result.stderr
     assert len(_gm_restarts(result)) == 3

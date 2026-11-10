@@ -301,7 +301,7 @@ def run_bootstrap(fake_ha: FakeHA, fake_docker: FakeDocker,
             if log_path.exists()
             else []
         )
-        seq = tmp_path_seq = fake_ha._log_path.parent / "call_sequence.log"  # type: ignore[attr-defined]
+        seq = fake_ha._log_path.parent / "call_sequence.log"  # type: ignore[attr-defined]
         result.sequence = seq.read_text().splitlines() if seq.exists() else []  # type: ignore[attr-defined]
         docker_log_path = fake_docker._log_path  # type: ignore[attr-defined]
         result.docker_calls = (  # type: ignore[attr-defined]
