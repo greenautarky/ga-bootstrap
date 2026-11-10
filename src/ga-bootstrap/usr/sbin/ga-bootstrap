@@ -55,7 +55,8 @@
 #   BG_BUDGET_S               default 1440  (whole-run budget; every step-3
 #                              wait is cut off at start+BG_BUDGET_S, kept
 #                              below the unit's TimeoutStartSec=1500)
-#   GM_READY_WAIT_S / GM_READY_STEP_S      default 300 / 10 (ha info running)
+#   GM_READY_WAIT_S / GM_READY_STEP_S      default 600 / 10 (ha info running;
+#                              ONE budget shared by both waits of a run)
 #   GM_POST_MAX_S / GM_POST_STEP_S         default 210 / 15 (protected POST)
 #   GM_START_MAX_S / GM_START_STEP_S       default 300 / 15 (addons start)
 #   GM_VISIBLE_WAIT_S / GM_VISIBLE_STEP_S  default 60 / 5   (container visible)
@@ -107,7 +108,8 @@ SLEEP_CMD="${SLEEP_CMD:-sleep}"
 T0=$(date +%s)
 BG_BUDGET_S="${BG_BUDGET_S:-1440}"
 T_END=$(( T0 + BG_BUDGET_S ))
-GM_READY_WAIT_S="${GM_READY_WAIT_S:-300}"
+GM_READY_WAIT_S="${GM_READY_WAIT_S:-600}"
+READY_SPENT_S=0   # seconds already slept in readiness waits (shared budget)
 GM_READY_STEP_S="${GM_READY_STEP_S:-10}"
 GM_POST_MAX_S="${GM_POST_MAX_S:-210}"
 GM_POST_STEP_S="${GM_POST_STEP_S:-15}"
@@ -163,10 +165,17 @@ ha_state_running() {
           | "$JQ_CLI" -r '.data.state // ""' 2>/dev/null) || return 1
   [ "$_st" = "running" ] || { echo "state=${_st:-none}"; return 1; }
 }
+# The two waits (before install, before first start) share ONE budget of
+# GM_READY_WAIT_S: the second only gets what the first left, so a single run
+# never spends 2x the bound. Spent time is the slept seconds ($_rc_i tries).
 wait_ready() {
-  log "waiting for Supervisor state=running ($1, up to ${GM_READY_WAIT_S}s)"
-  retry_cmd "Supervisor readiness" "$GM_READY_WAIT_S" "$GM_READY_STEP_S" ha_state_running \
-    || fail "Supervisor never reported state=running ($1)" 8
+  _wr_left=$(( GM_READY_WAIT_S - READY_SPENT_S ))
+  [ "$_wr_left" -ge 0 ] || _wr_left=0
+  log "waiting for Supervisor state=running ($1, up to ${_wr_left}s of the ${GM_READY_WAIT_S}s shared budget)"
+  _wr_rc=0
+  retry_cmd "Supervisor readiness" "$_wr_left" "$GM_READY_STEP_S" ha_state_running || _wr_rc=1
+  READY_SPENT_S=$(( READY_SPENT_S + (_rc_i - 1) * GM_READY_STEP_S ))
+  [ "$_wr_rc" -eq 0 ] || fail "Supervisor never reported state=running ($1)" 8
 }
 
 # --- 0. marker check (idempotent) -------------------------------------

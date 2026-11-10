@@ -1008,3 +1008,51 @@ def test_blip_then_recovery_succeeds(run_bootstrap, fake_ha, bootstrap_env):
     fake_ha.enqueue("store repositories", stdout=_HAPPY)
     result = run_bootstrap()
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+# --- 1.2.15: readiness bound 600 s, ONE shared budget (Odoo #1751) ---------
+# SLEEP_CMD seam is the fake clock: each fake sleep is one step of 10 s.
+
+_STARTUP = '{"result":"ok","data":{"state":"startup"}}'
+
+
+def _slept_total(tmp_path):
+    log = tmp_path / "sleeps.log"
+    if not log.exists():
+        return 0
+    return sum(int(x) for x in log.read_text().split())
+
+
+def test_startup_for_480s_then_running_succeeds_without_exit_8(
+        run_bootstrap, fake_ha, bootstrap_env):
+    """rc9 gate: Supervisor in startup ~8 min. 300 s bound -> exit 8."""
+    for _ in range(48):  # 48 x 10 s = 480 s
+        fake_ha.enqueue("info", stdout=_STARTUP)
+    result = run_bootstrap(GM_READY_STEP_S="10")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert Path(bootstrap_env["MARKER"]).is_file()
+
+
+def test_still_startup_after_600s_is_exit_8(run_bootstrap, fake_ha, bootstrap_env, tmp_path):
+    for _ in range(80):
+        fake_ha.enqueue("info", stdout=_STARTUP)
+    result = run_bootstrap(GM_READY_STEP_S="10")
+    assert result.returncode == 8, result.stdout + result.stderr
+    assert not [c for c in result.ha_calls if c[:2] == ["addons", "install"]]
+    assert _slept_total(tmp_path) == 600
+
+
+def test_two_readiness_waits_share_one_600s_budget(
+        run_bootstrap, fake_ha, bootstrap_env, tmp_path):
+    """First wait burns 480 s, then ready; Supervisor falls back to startup
+    before the first start: that wait may use only the remaining 120 s."""
+    for _ in range(48):
+        fake_ha.enqueue("info", stdout=_STARTUP)
+    fake_ha.enqueue("info", stdout='{"result":"ok","data":{"state":"running"}}')
+    for _ in range(80):
+        fake_ha.enqueue("info", stdout=_STARTUP)
+    result = run_bootstrap(GM_READY_STEP_S="10")
+    assert result.returncode == 8, result.stdout + result.stderr
+    assert "before first start" in result.stdout + result.stderr
+    assert not [c for c in result.ha_calls if c[:2] == ["addons", "start"]]
+    assert _slept_total(tmp_path) == 600, "2 waits together must not exceed the bound"
