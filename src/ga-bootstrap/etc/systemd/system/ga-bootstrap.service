@@ -42,7 +42,8 @@ SuccessExitStatus=0
 # stops anyway (= Condition gate fires).
 #
 # RestartSec=180 (3 min) balances responsiveness vs storm-avoidance.
-# StartLimitBurst=10 in 3600s (1h, set in [Unit] above) caps the loop — after that operator
+# StartLimitBurst=10 in 3600s (1h, set in [Unit] above; shortest failing cycle
+# is 600 s readiness wait + 180 s RestartSec = 780 s -> <= 5 starts/h) caps the loop — after that operator
 # must intervene so we don't hide a permanent problem behind infinite
 # retries.
 Restart=on-failure

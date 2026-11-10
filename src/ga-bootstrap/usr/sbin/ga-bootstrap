@@ -55,7 +55,8 @@
 #   BG_BUDGET_S               default 1440  (whole-run budget; every step-3
 #                              wait is cut off at start+BG_BUDGET_S, kept
 #                              below the unit's TimeoutStartSec=1500)
-#   GM_READY_WAIT_S / GM_READY_STEP_S      default 300 / 10 (ha info running)
+#   GM_READY_WAIT_S / GM_READY_STEP_S      default 600 / 10 (ha info running;
+#                              ONE budget shared by both waits of a run)
 #   GM_POST_MAX_S / GM_POST_STEP_S         default 210 / 15 (protected POST)
 #   GM_START_MAX_S / GM_START_STEP_S       default 300 / 15 (addons start)
 #   GM_VISIBLE_WAIT_S / GM_VISIBLE_STEP_S  default 60 / 5   (container visible)
@@ -107,7 +108,8 @@ SLEEP_CMD="${SLEEP_CMD:-sleep}"
 T0=$(date +%s)
 BG_BUDGET_S="${BG_BUDGET_S:-1440}"
 T_END=$(( T0 + BG_BUDGET_S ))
-GM_READY_WAIT_S="${GM_READY_WAIT_S:-300}"
+GM_READY_WAIT_S="${GM_READY_WAIT_S:-600}"
+READY_SPENT_S=0   # seconds already slept in readiness waits (shared budget)
 GM_READY_STEP_S="${GM_READY_STEP_S:-10}"
 GM_POST_MAX_S="${GM_POST_MAX_S:-210}"
 GM_POST_STEP_S="${GM_POST_STEP_S:-15}"
@@ -163,10 +165,47 @@ ha_state_running() {
           | "$JQ_CLI" -r '.data.state // ""' 2>/dev/null) || return 1
   [ "$_st" = "running" ] || { echo "state=${_st:-none}"; return 1; }
 }
+# The two waits (before install, before first start) share ONE budget of
+# GM_READY_WAIT_S: the second only gets what the first left, so a single run
+# never spends 2x the bound. Spent time is the slept seconds ($_rc_i tries).
 wait_ready() {
-  log "waiting for Supervisor state=running ($1, up to ${GM_READY_WAIT_S}s)"
-  retry_cmd "Supervisor readiness" "$GM_READY_WAIT_S" "$GM_READY_STEP_S" ha_state_running \
-    || fail "Supervisor never reported state=running ($1)" 8
+  _wr_left=$(( GM_READY_WAIT_S - READY_SPENT_S ))
+  [ "$_wr_left" -ge 0 ] || _wr_left=0
+  log "waiting for Supervisor state=running ($1, up to ${_wr_left}s of the ${GM_READY_WAIT_S}s shared budget)"
+  _wr_rc=0
+  retry_cmd "Supervisor readiness" "$_wr_left" "$GM_READY_STEP_S" ha_state_running || _wr_rc=1
+  READY_SPENT_S=$(( READY_SPENT_S + (_rc_i - 1) * GM_READY_STEP_S ))
+  [ "$_wr_rc" -eq 0 ] || fail "Supervisor never reported state=running ($1)" 8
+}
+
+# `ha store reload` makes Supervisor ls-remote+fetch every registered repo
+# anonymously; repeated reloads on first boot cause HTTP 429 / "store.git:
+# already a task in progress" (Odoo #1752). So: never a readiness probe, never
+# in a retry loop, and NOT after `store add` (add itself clones/fetches). Only
+# the recovery ladder reloads: at most STORE_RELOAD_MAX (1) per run, after
+# state=running and a logged backoff of STORE_RELOAD_BACKOFF_S (60 s).
+# Plain backoff sleeps are capped against the whole-run deadline T_END.
+# Returns 1 when the budget is exhausted (callers stop retrying).
+bg_sleep() {
+  _bs_left=$(( T_END - $(date +%s) ))
+  [ "$_bs_left" -gt 0 ] || return 1
+  [ "$1" -le "$_bs_left" ] || set -- "$_bs_left"
+  "$SLEEP_CMD" "$1"
+}
+STORE_RELOAD_COUNT=0
+STORE_RELOAD_MAX="${STORE_RELOAD_MAX:-1}"
+STORE_RELOAD_BACKOFF_S="${STORE_RELOAD_BACKOFF_S:-60}"
+store_reload() {
+  if [ "$STORE_RELOAD_COUNT" -ge "$STORE_RELOAD_MAX" ]; then
+    log "store reload skipped ($1): already $STORE_RELOAD_COUNT this run (429 guard)"
+    return 1
+  fi
+  wait_ready "before store reload ($1)"
+  log "store reload ($1): backing off ${STORE_RELOAD_BACKOFF_S}s first (429 guard)"
+  bg_sleep "$STORE_RELOAD_BACKOFF_S" || true
+  STORE_RELOAD_COUNT=$(( STORE_RELOAD_COUNT + 1 ))
+  log "store reload #$STORE_RELOAD_COUNT ($1)"
+  "$HA_CLI" store reload --no-progress >/dev/null 2>&1
 }
 
 # --- 0. marker check (idempotent) -------------------------------------
@@ -176,20 +215,11 @@ if [ -f "$MARKER" ]; then
 fi
 
 # --- 1. wait for supervisor -------------------------------------------
-log "waiting for Supervisor (up to ${SUPERVISOR_WAIT_S}s)"
-deadline=$(( $(date +%s) + SUPERVISOR_WAIT_S ))
-sup_info=""
-while :; do
-  sup_info=$("$HA_CLI" supervisor info --raw-json 2>/dev/null || true)
-  if printf '%s' "$sup_info" | grep -q '"result":"ok"'; then
-    log "Supervisor ready"
-    break
-  fi
-  if [ "$(date +%s)" -ge "$deadline" ]; then
-    fail "Supervisor never reported ok within ${SUPERVISOR_WAIT_S}s" 1
-  fi
-  sleep "$SUPERVISOR_POLL_INTERVAL"
-done
+# `ha supervisor info` answers result=ok DURING startup, so it gates nothing:
+# readiness is `ha info` state==running (shared budget), before any store work.
+wait_ready "before store add"
+log "Supervisor ready"
+sup_info=$("$HA_CLI" supervisor info --raw-json 2>/dev/null || true)
 
 # --- 1a. disable Supervisor auto-update -------------------------------
 # Why: fleet devices must not auto-update Supervisor — the rollout is
@@ -343,8 +373,7 @@ store_added=0
 for pre_sleep in $BACKOFF_SEQUENCE; do
   if [ "$pre_sleep" -gt 0 ]; then
     log "waiting ${pre_sleep}s before retry..."
-    "$HA_CLI" store reload --no-progress >/dev/null 2>&1 || true
-    sleep "$pre_sleep"
+    bg_sleep "$pre_sleep" || { log "whole-run budget (${BG_BUDGET_S}s) exhausted — no more retries"; break; }
   fi
   # Capture stderr+stdout so we can distinguish "already added" from
   # real failures. Exit code alone is insufficient — supervisor returns
@@ -373,7 +402,6 @@ for pre_sleep in $BACKOFF_SEQUENCE; do
     fi
     log "vibe_addons store registered + verified"
     store_added=1
-    "$HA_CLI" store reload --no-progress >/dev/null 2>&1 || true
     break
   elif [ "$rc" -eq 0 ]; then
     log "store add returned ok but repo not yet visible — retrying"
@@ -412,8 +440,7 @@ for pre_sleep in $BACKOFF_SEQUENCE; do
       if [ "$present_rc" -eq 0 ]; then
         log "vibe_addons store registered + verified (after lifting the condition)"
         store_added=1
-        "$HA_CLI" store reload --no-progress >/dev/null 2>&1 || true
-        break
+            break
       fi
       log "still not registered after lifting — falling through to backoff"
     else
@@ -545,17 +572,6 @@ addon_missing_from_store() {
   printf '%s' "$last_addon_info" | grep -q -i 'does not exist'
 }
 
-wait_supervisor_ready() {
-  _deadline=$(( $(date +%s) + SUPERVISOR_WAIT_S ))
-  while :; do
-    if "$HA_CLI" supervisor info --raw-json 2>/dev/null | grep -q '"result":"ok"'; then
-      return 0
-    fi
-    [ "$(date +%s)" -ge "$_deadline" ] && return 1
-    sleep "$SUPERVISOR_POLL_INTERVAL"
-  done
-}
-
 # Store-recovery ladder (Odoo #1337). Measured on a canary
 # (BOSv1.5.2-rc2, 2026-10-23): a power cut during the first store clone
 # left repository.json zero-length; Supervisor reset + re-cloned the store
@@ -574,8 +590,8 @@ store_recovery_ladder() {
     return 0
   fi
   log "WARN: $GA_MANAGER_SLUG does not exist although vibe_addons store is registered — rung 1: ha store reload"
-  "$HA_CLI" store reload --no-progress >/dev/null 2>&1 || \
-    log "WARN: rung 1: store reload returned non-zero"
+  store_reload "recovery rung 1" || \
+    log "WARN: rung 1: store reload skipped or returned non-zero"
   addons_installed "$GA_MANAGER_SLUG" || true
   if ! addon_missing_from_store; then
     log "WARN: rung 1: $GA_MANAGER_SLUG visible after store reload — continuing install"
@@ -584,11 +600,8 @@ store_recovery_ladder() {
   log "WARN: rung 1: $GA_MANAGER_SLUG still does not exist after store reload — rung 2: restarting Supervisor (once per run)"
   "$HA_CLI" supervisor restart --no-progress >/dev/null 2>&1 || \
     log "WARN: rung 2: supervisor restart returned non-zero (it may drop the connection) — waiting for it anyway"
-  if wait_supervisor_ready; then
-    log "WARN: rung 2: Supervisor answers again after restart"
-  else
-    log "WARN: rung 2: Supervisor did not answer within ${SUPERVISOR_WAIT_S}s after restart — continuing retries"
-  fi
+  wait_ready "after supervisor restart"
+  log "WARN: rung 2: Supervisor reports running again after restart"
   addons_installed "$GA_MANAGER_SLUG" || true
   if addon_missing_from_store; then
     log "WARN: rung 2: $GA_MANAGER_SLUG STILL does not exist after Supervisor restart — continuing install retries"
@@ -603,7 +616,7 @@ addon_ready=0
 for pre_sleep in $BACKOFF_SEQUENCE; do
   if [ "$pre_sleep" -gt 0 ]; then
     log "waiting ${pre_sleep}s before retry..."
-    sleep "$pre_sleep"
+    bg_sleep "$pre_sleep" || { log "whole-run budget (${BG_BUDGET_S}s) exhausted — no more retries"; break; }
   fi
   "$HA_CLI" addons install "$GA_MANAGER_SLUG" >/dev/null 2>&1 || true
   if addons_installed "$GA_MANAGER_SLUG"; then
@@ -727,19 +740,24 @@ esac
 # reports "running" within HA_CORE_WAIT_S we log + continue (do NOT
 # fail). The marker still gets written so a later boot isn't blocked
 # on this same wait — converge keeps an eye on Core health after that.
-log "waiting for HA Core to report state=running (up to ${HA_CORE_WAIT_S}s)"
+# Core "running" = `ha core stats` succeeds (GET /core/stats). The Supervisor's
+# /core/info has NO state field (supervisor/api/homeassistant.py info() on
+# 2025.11.4 and 2026.10.5), so the old `core info .data.state` poll could never
+# succeed and always burned the full wait ("last state=unknown", rc9 log).
+# /core/stats raises HomeAssistantNotRunningError (supervisor/homeassistant/
+# core.py stats()) when the container is absent or not running -> CLI non-zero.
+log "waiting for HA Core to be running (ha core stats, up to ${HA_CORE_WAIT_S}s)"
 deadline=$(( $(date +%s) + HA_CORE_WAIT_S ))
 # Best-effort wait must not push the run past the unit timeout.
 [ "$deadline" -le "$T_END" ] || deadline=$T_END
+core_out=""
 while :; do
-  state=$("$HA_CLI" core info --no-progress --raw-json 2>/dev/null \
-            | "$JQ_CLI" -r '.data.state // ""' 2>/dev/null || true)
-  if [ "$state" = "running" ]; then
-    log "HA Core state=running"
+  if core_out=$("$HA_CLI" core stats --no-progress --raw-json 2>&1); then
+    log "HA Core running (core stats answered)"
     break
   fi
   if [ "$(date +%s)" -ge "$deadline" ]; then
-    log "WARN: HA Core never reported running within ${HA_CORE_WAIT_S}s (last state=${state:-unknown}) — continuing"
+    log "WARN: HA Core never reported running within ${HA_CORE_WAIT_S}s (last core stats: ${core_out:-no output}) — continuing"
     break
   fi
   sleep "$HA_CORE_POLL_INTERVAL"
