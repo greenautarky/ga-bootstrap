@@ -9,19 +9,29 @@ creation, and `protected=false` was set only after the first start, so the first
 container had no docker.sock; the one restart then hit Supervisor "not ready".
 (Proven on a canary, BOSv1.6.0-rc8, Supervisor 2026.10.5.3.)
 
-After:
-- `protected=false` is POSTed right after install, BEFORE the first
-  `ha addons start`, so the first container already gets the bind.
+After (revised after independent review):
+- Readiness is `ha info` `.data.state == running` (`ha supervisor info` has no
+  state field and answers ok during startup). It is awaited (bounded, logged)
+  before install and before the first start; never ready -> exit 8.
+- `protected=false` is POSTed after install, BEFORE the first `ha addons start`,
+  with a bounded retry. If it is never accepted ga_manager is NOT started: exit 9
+  (systemd retries), no marker.
+- `ha addons start` is retried on "not ready" (GM_START_*), then exit 4.
+- The socket is ALWAYS verified after start, also when the flag was already
+  false; unbound -> restart retry -> re-check; the marker is never written with
+  an unbound socket. A container not yet visible right after start is retried
+  (GM_VISIBLE_*) before exit 6.
+- All new waits are capped by a whole-run deadline (BG_BUDGET_S=1440, below
+  TimeoutStartSec=1500); `$DOCKER_CLI` / `$SLEEP_CMD` seams.
 - `gm_container` resolves `app_<slug>` first, then `addon_<slug>` (older
   Supervisor). Its only call site is `gm_docker_sock_state` (the only former
   `addon_` docker inspect site).
 - Step 3a is now a verification after start. Socket absent: `ha addons restart`
   is retried (GM_RESTART_STEP_S=30 steps up to GM_RESTART_MAX_S=600) while
   Supervisor is not ready, then the mounts are re-checked.
-- New loud exit codes: 6 = ga_manager container not found under either name (or
-  not inspectable); 7 = docker.sock still unbound after restart, or restart never
-  succeeded in the bound. If the protected=false POST itself fails, a WARN is
-  logged and verification is skipped (unchanged non-fatal behaviour).
+- New loud exit codes: 6 = container not found under either name (or not
+  inspectable); 7 = docker.sock still unbound after restart / restart never
+  succeeded; 8 = Supervisor never ready; 9 = protected=false POST never accepted.
 
 ## 1.2.13 — 2026-11-09
 
