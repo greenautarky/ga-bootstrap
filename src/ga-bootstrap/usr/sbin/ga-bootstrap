@@ -106,9 +106,17 @@ JQ_CLI="${JQ_CLI:-jq}"
 DOCKER_CLI="${DOCKER_CLI:-docker}"
 SLEEP_CMD="${SLEEP_CMD:-sleep}"
 T0=$(date +%s)
-BG_BUDGET_S="${BG_BUDGET_S:-1440}"
+BG_BUDGET_S="${BG_BUDGET_S:-2340}"
 T_END=$(( T0 + BG_BUDGET_S ))
-GM_READY_WAIT_S="${GM_READY_WAIT_S:-600}"
+# Readiness (Odoo #2066). state=startup means the Supervisor is alive and bounded
+# by its own timeouts (Core API 10 min + 15 min, supervisor/homeassistant/core.py),
+# so it may be waited for up to GM_READY_WAIT_S (default 1500 s, shared by all
+# readiness waits of a run). state=none (no valid `ha info` answer: Supervisor
+# still in `setup`, whose API refuses every request, or hassio_cli/API down) is
+# NOT progress: GM_READY_NONE_MAX_S (default 600 s) in a row of it fails fast.
+GM_READY_WAIT_S="${GM_READY_WAIT_S:-1500}"
+GM_READY_NONE_MAX_S="${GM_READY_NONE_MAX_S:-600}"
+GM_READY_LOG_EVERY_S="${GM_READY_LOG_EVERY_S:-60}"
 READY_SPENT_S=0   # seconds already slept in readiness waits (shared budget)
 GM_READY_STEP_S="${GM_READY_STEP_S:-10}"
 GM_POST_MAX_S="${GM_POST_MAX_S:-210}"
@@ -160,22 +168,65 @@ retry_cmd() {
 
 # Supervisor readiness is `ha info` .data.state == running. (`ha supervisor
 # info` has no state field and answers ok during startup — it gates nothing.)
+# On failure prints WHY, one line: state=<startup|setup|...> when the Supervisor
+# answered, otherwise state=none plus the first line of what `ha` said (the
+# Supervisor API refuses every request while in `setup`, so it has no state).
 ha_state_running() {
-  _st=$("$HA_CLI" info --no-progress --raw-json 2>/dev/null \
-          | "$JQ_CLI" -r '.data.state // ""' 2>/dev/null) || return 1
-  [ "$_st" = "running" ] || { echo "state=${_st:-none}"; return 1; }
+  _raw=$("$HA_CLI" info --no-progress --raw-json 2>&1) || true
+  _st=$(printf '%s' "$_raw" | "$JQ_CLI" -r '.data.state // ""' 2>/dev/null) || _st=""
+  [ "$_st" = "running" ] && return 0
+  if [ -n "$_st" ]; then
+    echo "state=$_st"
+  else
+    echo "state=none (no state in \`ha info\`: $(printf '%s' "$_raw" | head -n 1 | cut -c1-160))"
+  fi
+  return 1
 }
-# The two waits (before install, before first start) share ONE budget of
-# GM_READY_WAIT_S: the second only gets what the first left, so a single run
-# never spends 2x the bound. Spent time is the slept seconds ($_rc_i tries).
+# The waits (before store add / reload / install / first start) share ONE budget
+# of GM_READY_WAIT_S: a later wait only gets what the earlier ones left, so a
+# single run never spends 2x the bound. Spent time is the slept seconds.
+# Polls continuously with a progress line every GM_READY_LOG_EVERY_S; gives up
+# (exit 8) when the budget is gone OR state=none lasted GM_READY_NONE_MAX_S in a
+# row (hang class: the Supervisor is not progressing, so waiting longer is pure
+# loss), or when the whole-run deadline T_END passes.
 wait_ready() {
   _wr_left=$(( GM_READY_WAIT_S - READY_SPENT_S ))
   [ "$_wr_left" -ge 0 ] || _wr_left=0
-  log "waiting for Supervisor state=running ($1, up to ${_wr_left}s of the ${GM_READY_WAIT_S}s shared budget)"
-  _wr_rc=0
-  retry_cmd "Supervisor readiness" "$_wr_left" "$GM_READY_STEP_S" ha_state_running || _wr_rc=1
-  READY_SPENT_S=$(( READY_SPENT_S + (_rc_i - 1) * GM_READY_STEP_S ))
-  [ "$_wr_rc" -eq 0 ] || fail "Supervisor never reported state=running ($1)" 8
+  log "waiting for Supervisor state=running ($1, up to ${_wr_left}s of the ${GM_READY_WAIT_S}s shared budget, state=none fails after ${GM_READY_NONE_MAX_S}s in a row)"
+  _wr_spent=0; _wr_none=0; _wr_isnone=0; _wr_since_log=0; _wr_n=0
+  while :; do
+    _wr_n=$(( _wr_n + 1 ))
+    if _wr_out=$(ha_state_running); then
+      READY_SPENT_S=$(( READY_SPENT_S + _wr_spent ))
+      return 0
+    fi
+    case "$_wr_out" in
+      state=none*) _wr_isnone=1 ;;
+      *) _wr_isnone=0; _wr_none=0 ;;
+    esac
+    if [ "$_wr_n" -eq 1 ] || [ "$_wr_since_log" -ge "$GM_READY_LOG_EVERY_S" ]; then
+      log "Supervisor readiness: ${_wr_out} (waited ${_wr_spent}s, ${_wr_left}s budget, $1)"
+      _wr_since_log=0
+    fi
+    if [ "$_wr_none" -ge "$GM_READY_NONE_MAX_S" ]; then
+      log "ERROR: ${_wr_out} for ${_wr_none}s in a row — Supervisor not progressing (stuck in setup, or hassio_cli/API down)"
+      break
+    fi
+    [ "$_wr_spent" -lt "$_wr_left" ] || break
+    # step 0 = test shortcut (no real sleeping): 3 tries, like retry_cmd
+    { [ "$GM_READY_STEP_S" -gt 0 ] || [ "$_wr_n" -lt 3 ]; } || break
+    if [ "$(date +%s)" -ge "$T_END" ]; then
+      log "Supervisor readiness: whole-run budget (${BG_BUDGET_S}s) exhausted"
+      break
+    fi
+    "$SLEEP_CMD" "$GM_READY_STEP_S"
+    _wr_spent=$(( _wr_spent + GM_READY_STEP_S ))
+    [ "$_wr_isnone" -eq 0 ] || _wr_none=$(( _wr_none + GM_READY_STEP_S ))
+    _wr_since_log=$(( _wr_since_log + GM_READY_STEP_S ))
+  done
+  READY_SPENT_S=$(( READY_SPENT_S + _wr_spent ))
+  log "Supervisor readiness gave up: last ${_wr_out}, waited ${_wr_spent}s"
+  fail "Supervisor never reported state=running ($1)" 8
 }
 
 # `ha store reload` makes Supervisor ls-remote+fetch every registered repo

@@ -1043,7 +1043,7 @@ def test_startup_for_480s_then_running_succeeds_without_exit_8(
 def test_still_startup_after_600s_is_exit_8(run_bootstrap, fake_ha, bootstrap_env, tmp_path):
     for _ in range(80):
         fake_ha.enqueue("info", stdout=_STARTUP)
-    result = run_bootstrap(GM_READY_STEP_S="10")
+    result = run_bootstrap(GM_READY_STEP_S="10", GM_READY_WAIT_S="600")
     assert result.returncode == 8, result.stdout + result.stderr
     assert not [c for c in result.ha_calls if c[:2] == ["addons", "install"]]
     assert _slept_total(tmp_path) == 600
@@ -1058,7 +1058,7 @@ def test_two_readiness_waits_share_one_600s_budget(
     fake_ha.enqueue("info", stdout='{"result":"ok","data":{"state":"running"}}')
     for _ in range(80):
         fake_ha.enqueue("info", stdout=_STARTUP)
-    result = run_bootstrap(GM_READY_STEP_S="10")
+    result = run_bootstrap(GM_READY_STEP_S="10", GM_READY_WAIT_S="600")
     assert result.returncode == 8, result.stdout + result.stderr
     assert "before install" in result.stdout + result.stderr
     assert not [c for c in result.ha_calls if c[:2] == ["addons", "install"]]
@@ -1130,3 +1130,81 @@ def test_backoff_sleeps_are_capped_by_whole_run_budget(
     result = run_bootstrap(BG_BUDGET_S="0", BACKOFF_SEQUENCE="0 30 30 30")
     assert "whole-run budget" in result.stdout + result.stderr
     assert _count(result, "store add") <= 2
+
+
+# --- 1.2.16: slow Supervisor vs hung Supervisor (Odoo #2066) ----------------
+# slow = `ha info` answers state=startup (Core first start, measured 10-13 min)
+# hung = `ha info` has no state at all (Supervisor in `setup`: its API refuses
+#        every request; or hassio_cli/API down) - K31 BOSv1.6.1-rc1, 2026-11-16.
+# Fake clock: SLEEP_CMD seam, one fake sleep = one 10 s step.
+
+def _no_state(fake_ha, n):
+    for _ in range(n):
+        fake_ha.enqueue("info", stdout="",
+                        stderr="Error: Get http://hassio/info: connection refused", code=1)
+
+
+def test_slow_startup_900s_then_running_succeeds_in_one_pass(
+        run_bootstrap, fake_ha, bootstrap_env, tmp_path):
+    """Friday 13.11.: startup took ~10-13 min. Old 600 s budget -> exit 8 + 180 s gap."""
+    for _ in range(90):  # 900 s
+        fake_ha.enqueue("info", stdout=_STARTUP)
+    result = run_bootstrap(GM_READY_STEP_S="10")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert Path(bootstrap_env["MARKER"]).is_file()
+    assert _slept_total(tmp_path) >= 900
+
+
+def test_startup_that_never_ends_gives_up_at_the_shared_1500s_bound(
+        run_bootstrap, fake_ha, tmp_path):
+    for _ in range(200):
+        fake_ha.enqueue("info", stdout=_STARTUP)
+    result = run_bootstrap(GM_READY_STEP_S="10")
+    assert result.returncode == 8, result.stdout + result.stderr
+    assert _slept_total(tmp_path) == 1500
+
+
+def test_no_state_for_600s_in_a_row_fails_fast_and_says_why(
+        run_bootstrap, fake_ha, tmp_path):
+    """The hang: no state at all. Waiting 1500 s would be pure loss."""
+    _no_state(fake_ha, 200)
+    result = run_bootstrap(GM_READY_STEP_S="10")
+    out = result.stdout + result.stderr
+    assert result.returncode == 8, out
+    assert _slept_total(tmp_path) == 600
+    assert "state=none" in out
+    assert "connection refused" in out, "the reason from `ha` must be visible"
+    assert "not progressing" in out
+
+
+def test_no_state_streak_is_reset_by_startup(run_bootstrap, fake_ha, bootstrap_env):
+    """400 s no state (setup), then 800 s startup, then running: slow, not hung."""
+    _no_state(fake_ha, 40)
+    for _ in range(80):
+        fake_ha.enqueue("info", stdout=_STARTUP)
+    result = run_bootstrap(GM_READY_STEP_S="10")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert Path(bootstrap_env["MARKER"]).is_file()
+
+
+def test_progress_is_logged_every_minute_not_every_poll(run_bootstrap, fake_ha):
+    for _ in range(48):  # 480 s of startup
+        fake_ha.enqueue("info", stdout=_STARTUP)
+    result = run_bootstrap(GM_READY_STEP_S="10")
+    assert result.returncode == 0, result.stdout + result.stderr
+    n = (result.stdout + result.stderr).count("Supervisor readiness: state=startup")
+    assert 8 <= n <= 10, n
+
+
+def test_unit_budgets_fit_together():
+    from conftest import BOOTSTRAP_SCRIPT, REPO_ROOT
+    """whole-run budget < TimeoutStartSec; readiness bound inside the run budget."""
+    import re
+    unit = (REPO_ROOT / "src/ga-bootstrap/etc/systemd/system/ga-bootstrap.service").read_text()
+    script = BOOTSTRAP_SCRIPT.read_text()
+    tstart = int(re.search(r"^TimeoutStartSec=(\d+)$", unit, re.M).group(1))
+    run = int(re.search(r'BG_BUDGET_S="\$\{BG_BUDGET_S:-(\d+)\}"', script).group(1))
+    ready = int(re.search(r'GM_READY_WAIT_S="\$\{GM_READY_WAIT_S:-(\d+)\}"', script).group(1))
+    assert run < tstart
+    assert ready + 840 <= run  # readiness bound + the other waits' old 840 s
+

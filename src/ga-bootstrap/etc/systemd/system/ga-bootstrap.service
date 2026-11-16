@@ -15,7 +15,7 @@ StartLimitBurst=10
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-TimeoutStartSec=1500
+TimeoutStartSec=2400
 # Optional override file under /mnt/data (= writable on HAOS, unlike /etc).
 # Lets operators / bench tests point ga-bootstrap at non-default paths
 # without rebuilding the OS image — e.g.
