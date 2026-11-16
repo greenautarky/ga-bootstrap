@@ -1219,3 +1219,29 @@ def test_stderr_noise_on_a_running_answer_does_not_hide_the_state(
     result = run_bootstrap(GM_READY_STEP_S="10")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Supervisor readiness: state=none" not in result.stdout + result.stderr
+
+
+# --- 1.2.17: `ha addons info` deprecation warning on stderr (Odoo #2132) -----
+# hassio-cli 2026.10.1 prints "The use of 'addons' is deprecated..." on STDERR.
+# DUT2 dev10: the 2>&1 merge made jq fail -> "not installed" forever (367 restarts).
+
+_ADDONS_WARN = "The use of 'addons' is deprecated. Please use 'apps' instead."
+
+
+def test_deprecation_warning_on_stderr_does_not_hide_an_installed_addon(
+        run_bootstrap, fake_ha, bootstrap_env):
+    for _ in range(10):
+        fake_ha.enqueue("addons info", stdout='{"result":"ok","data":{"version":"0.27.0"}}',
+                        stderr=_ADDONS_WARN)
+    result = run_bootstrap()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert Path(bootstrap_env["MARKER"]).is_file()
+
+
+def test_unparseable_addons_info_stdout_is_loud(run_bootstrap, fake_ha):
+    """stdout that is not JSON must say so, not read as plain 'not installed'."""
+    for _ in range(40):
+        fake_ha.enqueue("addons info", stdout="<html>bad gateway</html>")
+    result = run_bootstrap()
+    out = result.stdout + result.stderr
+    assert "ERROR: `ha addons info" in out and "not JSON" in out, out

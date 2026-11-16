@@ -613,8 +613,19 @@ addons_installed() {
   # Check the VALUE, not just key presence.
   # The raw reply is kept in $last_addon_info so the caller can tell
   # "does not exist" (store not loaded) from "known, not installed".
-  last_addon_info=$("$HA_CLI" addons info "$1" --no-progress --raw-json 2>&1 || true)
-  _v=$(printf '%s' "$last_addon_info" \
+  # stdout alone is parsed: hassio-cli 2026.10.1 prints a deprecation warning on
+  # STDERR, and merging it made jq fail = "not installed" forever (Odoo #2132).
+  # stderr is appended to $last_addon_info only for the "does not exist" text
+  # check. Non-empty stdout that is not JSON is an ERROR, not "not installed".
+  _ai_err=$(mktemp) || _ai_err=/dev/null
+  _ai_out=$("$HA_CLI" addons info "$1" --no-progress --raw-json 2>"$_ai_err" || true)
+  last_addon_info="${_ai_out}$(cat "$_ai_err" 2>/dev/null)"
+  [ "$_ai_err" = /dev/null ] || rm -f "$_ai_err"
+  if [ -n "$_ai_out" ] && ! printf '%s' "$_ai_out" | "$JQ_CLI" -e '.' >/dev/null 2>&1; then
+    log "ERROR: \`ha addons info $1\` stdout is not JSON: $(printf '%s' "$_ai_out" | head -n 1 | cut -c1-160)"
+    return 1
+  fi
+  _v=$(printf '%s' "$_ai_out" \
         | "$JQ_CLI" -r '(.data.version // .version // empty)' 2>/dev/null || true)
   [ -n "${_v}" ] && [ "${_v}" != "null" ]
 }
