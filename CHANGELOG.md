@@ -1,3 +1,13 @@
+## 1.2.17 — 2026-11-16
+
+### fix: `ha addons info` stdout parsed alone, parse errors are loud (Odoo #2132)
+
+hassio-cli 2026.10.1 prints "The use of 'addons' is deprecated..." on STDERR.
+`addons_installed()` merged stderr into the JSON (`2>&1`), jq failed, and an
+installed ga_manager read as "not installed" forever (DUT2 dev10, NRestarts 367).
+Now only stdout is parsed; stderr is kept only for the "does not exist" text
+check. Non-empty stdout that is not JSON logs `ERROR: ... stdout is not JSON`.
+
 ## 1.2.16 — 2026-11-16
 
 ### fix: Supervisor readiness polls continuously, fails fast only on no-state (Odoo #2066)
