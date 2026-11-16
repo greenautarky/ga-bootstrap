@@ -1208,3 +1208,14 @@ def test_unit_budgets_fit_together():
     assert run < tstart
     assert ready + 840 <= run  # readiness bound + the other waits' old 840 s
 
+
+
+def test_stderr_noise_on_a_running_answer_does_not_hide_the_state(
+        run_bootstrap, fake_ha, bootstrap_env):
+    """`ha` may warn on stderr while stdout is the valid answer: state is read
+    from stdout only (a healthy Supervisor must not look like state=none)."""
+    fake_ha.enqueue("info", stdout='{"result":"ok","data":{"state":"running"}}',
+                    stderr="warning: deprecated flag")
+    result = run_bootstrap(GM_READY_STEP_S="10")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Supervisor readiness: state=none" not in result.stdout + result.stderr

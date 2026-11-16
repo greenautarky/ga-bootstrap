@@ -1,3 +1,21 @@
+## 1.2.16 — 2026-11-16
+
+### fix: Supervisor readiness polls continuously, fails fast only on no-state (Odoo #2066)
+
+Before: readiness budget 600 s -> exit 8 -> 180 s systemd gap, although Core's
+first start on a fresh iHost (the Supervisor `startup` phase) takes 10-13 min.
+
+After:
+- `GM_READY_WAIT_S` 1500 (= the Supervisor's own bound); `BG_BUDGET_S` 2340,
+  unit `TimeoutStartSec` 2400. Progress line every 60 s with the reason.
+- `state=none` (no valid `ha info` answer: Supervisor in `setup`, or
+  hassio_cli/API down) for `GM_READY_NONE_MAX_S` (600 s) in a row fails fast
+  with `ha`'s first error line in the message. `state=startup` resets the streak.
+- `ha info` state is parsed from stdout only; stderr just supplies the reason
+  (stderr noise next to a valid answer no longer reads as state=none).
+- `RestartSec=180` kept on purpose: exit 3 (GHCR creds missing) relies on
+  180 s x StartLimitBurst 10 while the fleet-manager pushes creds.
+
 ## 1.2.15 — 2026-11-10
 
 ### fix: Supervisor readiness bound 300 s -> 600 s, one shared budget (Odoo #1751)

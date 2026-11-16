@@ -172,8 +172,13 @@ retry_cmd() {
 # answered, otherwise state=none plus the first line of what `ha` said (the
 # Supervisor API refuses every request while in `setup`, so it has no state).
 ha_state_running() {
-  _raw=$("$HA_CLI" info --no-progress --raw-json 2>&1) || true
+  # stdout alone is parsed (stderr noise next to a valid answer must not turn a
+  # running Supervisor into state=none); stderr only supplies the reason.
+  _err=$(mktemp) || _err=/dev/null
+  _raw=$("$HA_CLI" info --no-progress --raw-json 2>"$_err") || true
   _st=$(printf '%s' "$_raw" | "$JQ_CLI" -r '.data.state // ""' 2>/dev/null) || _st=""
+  [ -n "$_raw" ] || _raw=$(cat "$_err" 2>/dev/null)
+  [ "$_err" = /dev/null ] || rm -f "$_err"
   [ "$_st" = "running" ] && return 0
   if [ -n "$_st" ]; then
     echo "state=$_st"
