@@ -25,7 +25,7 @@ _FROM_FILE = {"-f", "--from-file"}
 # parse check, creds host list + username + password, version, protected,
 # ha info state, addons info JSON check).
 # Update deliberately when a jq call is added or removed.
-EXPECTED_LIVE_PROGRAMS = 10
+EXPECTED_LIVE_PROGRAMS = 14
 TRUNCATED = "<<shell-quote-truncated-program>>"
 
 

@@ -129,7 +129,8 @@ else:
     elif key == 'core stats':
         stdout, stderr, code = '{{"result":"ok","data":{{"cpu_percent":1.0}}}}', '', 0
     elif key == 'core info':
-        stdout, stderr, code = '{{"result":"ok","data":{{"state":"running"}}}}', '', 0
+        stdout, stderr, code = (
+            '{{"result":"ok","data":{{"version":"2026.10.4.6","port":8123,"ssl":false}}}}', '', 0)
     elif key == 'info':
         stdout, stderr, code = '{{"result":"ok","data":{{"state":"running"}}}}', '', 0
     elif key == 'store add':
@@ -176,6 +177,16 @@ sys.exit(code)
 """
     )
     fake_path.chmod(0o755)
+
+    # curl shim: body/rc per call from curl_body / curl_rc, URLs recorded.
+    curl = bin_dir / "curl"
+    curl.write_text(
+        "#!/bin/sh\n"
+        f'for a in "$@"; do :; done; echo "$a" >> {tmp_path}/curl_calls.log\n'
+        f'cat {tmp_path}/curl_body 2>/dev/null; exit "$(cat {tmp_path}/curl_rc)"\n')
+    curl.chmod(0o755)
+    (tmp_path / "curl_body").write_text('{"name":"Home Assistant","start_url":"/?homescreen=1"}')
+    (tmp_path / "curl_rc").write_text("0")
 
     controller = FakeHA()
     controller.model_path = model_path  # type: ignore[attr-defined]

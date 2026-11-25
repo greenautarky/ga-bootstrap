@@ -31,7 +31,7 @@ def test_happy_path_writes_marker_and_calls_expected_commands(run_bootstrap, boo
     registry_idx = next(i for i, s in enumerate(flat) if "docker registries" in s)
     install_idx = next(i for i, s in enumerate(flat) if "addons install" in s)
     start_idx = next(i for i, s in enumerate(flat) if "addons start" in s)
-    core_idx = next(i for i, s in enumerate(flat) if "core stats" in s)
+    core_idx = next(i for i, s in enumerate(flat) if "core info" in s)
     assert sup_idx < store_idx < registry_idx < install_idx < start_idx < core_idx
 
 
@@ -258,47 +258,78 @@ def test_auto_update_options_failure_is_non_fatal(run_bootstrap, fake_ha, bootst
 # --- Step 6: wait for HA Core ready -----------------------------------
 
 
-_CORE_INFO_REAL = ('{"result":"ok","data":{"version":"2026.10.5","version_latest":'
-                   '"2026.10.5","arch":"aarch64","image":"x","machine":"y"}}')  # NO state key
+def _core_info(version="2026.10.4.6", port="8123", ssl="false"):
+    return (f'{{"result":"ok","data":{{"version":{json.dumps(version)},"version_latest":'
+            f'"2026.10.4.6","arch":"armv7","port":{port},"ssl":{ssl}}}}}')  # NO state key
 
 
-def _core_stats_calls(result):
-    return [c for c in result.ha_calls if c[:2] == ["core", "stats"]]
+def _curl_urls(tmp_path):
+    log = tmp_path / "curl_calls.log"
+    return log.read_text().split() if log.exists() else []
 
 
-def test_core_ready_immediately_writes_marker(run_bootstrap, fake_ha, bootstrap_env):
-    """Real /core/info shape has no state key; readiness is `core stats`.
-    Red on old code: it polled core info .data.state, never saw running."""
-    for _ in range(10):
-        fake_ha.enqueue("core info", stdout=_CORE_INFO_REAL)
+def _out(result):
+    return result.stdout + result.stderr
+
+
+def test_core_serving_is_running(run_bootstrap, bootstrap_env, tmp_path):
     result = run_bootstrap()
     assert result.returncode == 0, result.stderr
     assert Path(bootstrap_env["MARKER"]).is_file()
-    assert len(_core_stats_calls(result)) == 1
-    assert "never reported running" not in result.stdout + result.stderr
+    assert "HA Core running (Core 2026.10.4.6 serves on port 8123)" in _out(result)
+    assert _curl_urls(tmp_path) == ["http://127.0.0.1:8123/manifest.json"]
 
 
-def test_core_never_ready_still_writes_marker_with_loud_warning(
-    run_bootstrap, fake_ha, bootstrap_env
-):
-    """Best-effort: if Core never runs we log a WARN (with the last output) and
-    continue; the marker is still written."""
-    for _ in range(10):
-        fake_ha.enqueue("core stats", stderr="Error: Home Assistant is not running", code=1)
+def test_landingpage_is_not_core_running(run_bootstrap, fake_ha, bootstrap_env, tmp_path):
+    """DUT2 dev9 2026-11-12: stats answered while only the landingpage ran (Odoo #1986)."""
+    for _ in range(20):
+        fake_ha.enqueue("core info", stdout=_core_info("landingpage"))
     result = run_bootstrap()
-    assert result.returncode == 0, result.stderr
-    assert Path(bootstrap_env["MARKER"]).is_file()
-    out = result.stdout + result.stderr
-    assert "HA Core never reported running" in out and "not running" in out
+    assert "HA Core running" not in _out(result)
+    assert "<3>[ga-bootstrap] ERROR: HA Core NOT serving" in _out(result)
+    assert "only the landingpage runs" in _out(result)
+    assert Path(bootstrap_env["MARKER"]).is_file()  # policy unchanged: gm is up
+    assert _curl_urls(tmp_path) == []
 
 
-def test_core_eventually_ready_succeeds(run_bootstrap, fake_ha, bootstrap_env):
+@pytest.mark.parametrize(("body", "rc", "why"), [
+    ("curl: (22) The requested URL returned error: 404", "22", "does not serve on port"),
+    ('<a href="http://127.0.0.1/manifest.json">Found</a>.', "0", "is not Core's"),
+    ("", "0", "is not Core's"),
+    ('{"result":"ok"}', "0", "is not Core's"),
+    ("curl: (7) Failed to connect", "7", "Failed to connect"),
+])
+def test_core_version_without_a_serving_core_is_not_running(
+        run_bootstrap, tmp_path, body, rc, why):
+    """A real version but the landingpage's answers (302 body / 404), or nothing."""
+    (tmp_path / "curl_body").write_text(body)
+    (tmp_path / "curl_rc").write_text(rc)
+    result = run_bootstrap(HA_CORE_WAIT_S="1")
+    assert "HA Core running" not in _out(result)
+    assert why in _out(result)
+
+
+@pytest.mark.parametrize("info", [
+    _core_info(""), _core_info(port="null"), _core_info(port='"x"'), "not json", ""])
+def test_unusable_core_info_is_not_running(run_bootstrap, fake_ha, info):
+    for _ in range(20):
+        fake_ha.enqueue("core info", stdout=info)
+    assert "HA Core running" not in _out(run_bootstrap(HA_CORE_WAIT_S="1"))
+
+
+def test_core_eventually_serving_succeeds(run_bootstrap, fake_ha, bootstrap_env):
     for _ in range(2):
-        fake_ha.enqueue("core stats", stderr="Error: not running", code=1)
+        fake_ha.enqueue("core info", stdout=_core_info("landingpage"))
     result = run_bootstrap()
     assert result.returncode == 0, result.stderr
+    assert "HA Core running" in _out(result)
     assert Path(bootstrap_env["MARKER"]).is_file()
-    assert len(_core_stats_calls(result)) == 3
+
+
+def test_core_port_and_ssl_come_from_core_info(run_bootstrap, fake_ha, tmp_path):
+    fake_ha.enqueue("core info", stdout=_core_info(port="80", ssl="true"))
+    run_bootstrap()
+    assert _curl_urls(tmp_path) == ["https://127.0.0.1:80/manifest.json"]
 
 
 # ─── v1.2.8: force protected=false on ga_manager addon ───────────────
@@ -388,7 +419,7 @@ def test_protected_false_post_happens_before_first_start(run_bootstrap):
     post = next(i for i, ln in enumerate(seq) if ln.startswith("docker exec hassio_cli"))
     start = next(i for i, ln in enumerate(seq) if ln.startswith("ha addons start"))
     install = next(i for i, ln in enumerate(seq) if ln.startswith("ha addons install"))
-    core = next(i for i, ln in enumerate(seq) if ln.startswith("ha core stats"))
+    core = next(i for i, ln in enumerate(seq) if ln.startswith("ha core info"))
     assert install < post < start < core, seq
     assert seq.count("ha addons start 99f1cad4_ga_manager") == 1, seq
     out = result.stdout

@@ -51,6 +51,7 @@
 #   HA_CORE_POLL_INTERVAL     default 10
 #   JQ_CLI                    default jq    (path / fallback for the json parser)
 #   DOCKER_CLI                default docker
+#   CURL_CLI                  default curl  (Core outcome check)
 #   SLEEP_CMD                 default sleep (test seam for the step-3 waits)
 #   BG_BUDGET_S               default 1440  (whole-run budget; every step-3
 #                              wait is cut off at start+BG_BUDGET_S, kept
@@ -105,6 +106,7 @@ HA_CLI="${HA_CLI:-ha}"
 JQ_CLI="${JQ_CLI:-jq}"
 DOCKER_CLI="${DOCKER_CLI:-docker}"
 SLEEP_CMD="${SLEEP_CMD:-sleep}"
+CURL_CLI="${CURL_CLI:-curl}"
 T0=$(date +%s)
 BG_BUDGET_S="${BG_BUDGET_S:-2340}"
 T_END=$(( T0 + BG_BUDGET_S ))
@@ -807,24 +809,44 @@ esac
 # reports "running" within HA_CORE_WAIT_S we log + continue (do NOT
 # fail). The marker still gets written so a later boot isn't blocked
 # on this same wait — converge keeps an eye on Core health after that.
-# Core "running" = `ha core stats` succeeds (GET /core/stats). The Supervisor's
-# /core/info has NO state field (supervisor/api/homeassistant.py info() on
-# 2025.11.4 and 2026.10.5), so the old `core info .data.state` poll could never
-# succeed and always burned the full wait ("last state=unknown", rc9 log).
-# /core/stats raises HomeAssistantNotRunningError (supervisor/homeassistant/
-# core.py stats()) when the container is absent or not running -> CLI non-zero.
-log "waiting for HA Core to be running (ha core stats, up to ${HA_CORE_WAIT_S}s)"
+# Core "running" is an OUTCOME, not a container (Odoo #1986): `ha core stats`
+# also answers while only the Supervisor's landingpage runs. Required:
+#   1. `ha core info` .data.version is a real version (not landingpage/empty)
+#   2. GET /manifest.json on Core's own port (.data.port/.ssl) is Core's JSON.
+# Measured on the real images (2026-11-25): Core answers it with 200 JSON and
+# needs no login; the landingpage answers 302 (8123) / 404 (80). NOT /api/: the
+# landingpage answers 401 there too, and Core books every 401 as a failed login
+# (warning + notification for the resident). /core/info has NO state field.
+core_outcome() {  # prints why not; rc 0 = Core serves
+  _ci=$("$HA_CLI" core info --no-progress --raw-json 2>/dev/null) || { echo "ha core info failed"; return 1; }
+  _cv=$(printf '%s' "$_ci" | "$JQ_CLI" -r '.data.version // ""' 2>/dev/null) || _cv=""
+  case "$_cv" in
+    ''|null) echo "no Core version in ha core info"; return 1 ;;
+    landingpage) echo "only the landingpage runs (version=landingpage)"; return 1 ;;
+  esac
+  _cp=$(printf '%s' "$_ci" | "$JQ_CLI" -r '.data.port // ""' 2>/dev/null) || _cp=""
+  case "$_cp" in ''|*[!0-9]*) echo "Core $_cv: no port in ha core info"; return 1 ;; esac
+  _cs=$(printf '%s' "$_ci" | "$JQ_CLI" -r 'if .data.ssl == true then "https" else "http" end' 2>/dev/null) || _cs=http
+  _cb=$("$CURL_CLI" -fsSk --max-time 10 "$_cs://127.0.0.1:$_cp/manifest.json" 2>&1) \
+    || { echo "Core $_cv does not serve on port $_cp: $(printf '%s' "$_cb" | head -n 1 | cut -c1-120)"; return 1; }
+  printf '%s' "$_cb" | "$JQ_CLI" -e 'type == "object" and has("start_url")' >/dev/null 2>&1 \
+    || { echo "Core $_cv: /manifest.json on port $_cp is not Core's"; return 1; }
+  echo "Core $_cv serves on port $_cp"
+}
+log "waiting for HA Core to serve (core info + /manifest.json, up to ${HA_CORE_WAIT_S}s)"
 deadline=$(( $(date +%s) + HA_CORE_WAIT_S ))
 # Best-effort wait must not push the run past the unit timeout.
 [ "$deadline" -le "$T_END" ] || deadline=$T_END
 core_out=""
 while :; do
-  if core_out=$("$HA_CLI" core stats --no-progress --raw-json 2>&1); then
-    log "HA Core running (core stats answered)"
+  if core_out=$(core_outcome); then
+    log "HA Core running ($core_out)"
     break
   fi
   if [ "$(date +%s)" -ge "$deadline" ]; then
-    log "WARN: HA Core never reported running within ${HA_CORE_WAIT_S}s (last core stats: ${core_out:-no output}) — continuing"
+    # <3> = journal priority err. The marker is still written (gm is up and
+    # converge watches Core); the log must not read as success.
+    printf '<3>[ga-bootstrap] ERROR: HA Core NOT serving within %ss: %s - marker is written, Core is NOT proven\n' "$HA_CORE_WAIT_S" "$core_out"
     break
   fi
   sleep "$HA_CORE_POLL_INTERVAL"
