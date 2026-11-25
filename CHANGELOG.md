@@ -1,3 +1,12 @@
+## 1.2.19 — unreleased
+
+### fix: "HA Core running" is an outcome check, the landingpage no longer passes (Odoo #1986)
+
+`ha core stats` also answers for the landingpage, so a device without Core logged
+"HA Core running". Now: `ha core info` version is not `landingpage` AND
+`/manifest.json` on Core's port is Core's JSON. A Core that does not serve in time
+is an ERROR at journal priority err (was WARN). The marker policy is unchanged.
+
 ## 1.2.17 — 2026-11-16
 
 ### fix: `ha addons info` stdout parsed alone, parse errors are loud (Odoo #2132)
