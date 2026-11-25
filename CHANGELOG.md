@@ -1,3 +1,12 @@
+## 1.2.18 — unreleased
+
+### fix: wait for GHCR creds inside the run instead of exit 3 at once (Odoo #1747)
+
+Missing creds (mesh or fm not reachable yet) are polled every 10 s for up to
+`BG_BUDGET_S - 900` s (1440 s), then exit 3 as before. The failing cycle grows from
+183 s to >= 1620 s, so it can no longer exhaust StartLimitBurst=10/3600 s (the unit
+was refused after ~33 min). `TimeoutStartSec` and `RestartSec` are unchanged.
+
 ## 1.2.17 — 2026-11-16
 
 ### fix: `ha addons info` stdout parsed alone, parse errors are loud (Odoo #2132)

@@ -321,6 +321,8 @@ def bootstrap_env(tmp_path: Path) -> dict[str, str]:
         "BG_DRY_RUN": "0",
         "SLEEP_CMD": str(tmp_path / "fake_sleep"),
         "GM_READY_STEP_S": "0",
+        # no creds wait unless a test asks for it (fake clock: counted sleeps)
+        "CREDS_RESERVE_S": "2340",
         "GM_POST_STEP_S": "0",
         "GM_START_STEP_S": "0",
         "GM_VISIBLE_STEP_S": "0",

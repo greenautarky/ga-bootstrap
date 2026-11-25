@@ -52,9 +52,11 @@
 #   JQ_CLI                    default jq    (path / fallback for the json parser)
 #   DOCKER_CLI                default docker
 #   SLEEP_CMD                 default sleep (test seam for the step-3 waits)
-#   BG_BUDGET_S               default 1440  (whole-run budget; every step-3
-#                              wait is cut off at start+BG_BUDGET_S, kept
-#                              below the unit's TimeoutStartSec=1500)
+#   BG_BUDGET_S               default 2340  (whole-run budget; every wait is
+#                              cut off at start+BG_BUDGET_S, kept below the
+#                              unit's TimeoutStartSec=2400)
+#   CREDS_POLL_S / CREDS_RESERVE_S         default 10 / 900 (wait for GHCR creds
+#                              until BG_BUDGET_S - reserve, then exit 3)
 #   GM_READY_WAIT_S / GM_READY_STEP_S      default 600 / 10 (ha info running;
 #                              ONE budget shared by both waits of a run)
 #   GM_POST_MAX_S / GM_POST_STEP_S         default 210 / 15 (protected POST)
@@ -127,6 +129,9 @@ GM_VISIBLE_WAIT_S="${GM_VISIBLE_WAIT_S:-60}"
 GM_VISIBLE_STEP_S="${GM_VISIBLE_STEP_S:-5}"
 GM_RESTART_MAX_S="${GM_RESTART_MAX_S:-600}"
 GM_RESTART_STEP_S="${GM_RESTART_STEP_S:-30}"
+CREDS_POLL_S="${CREDS_POLL_S:-10}"
+CREDS_RESERVE_S="${CREDS_RESERVE_S:-900}"
+CREDS_LOG_EVERY_S="${CREDS_LOG_EVERY_S:-60}"
 DRY_RUN="${BG_DRY_RUN:-0}"
 # Exponential-backoff sequence for the two retry loops (store-add +
 # addons-install). Space-separated pre-sleep seconds. Tests override
@@ -537,32 +542,46 @@ done
 # long as fleet-manager has dispatched its ghcr-creds-push job (= which
 # cred_autopush.py does automatically on new-device registration).
 GHCR_CREDS_FILE_FOUND=""
-# Round 1: literal paths (= cheap, common case)
-for candidate in \
-    "$GHCR_CREDS_FILE" \
-    "/etc/ga/ghcr-creds.json" \
-    "/mnt/data/ghcr-creds.json"; do
-  if [ -n "$candidate" ] && [ -f "$candidate" ]; then
-    GHCR_CREDS_FILE_FOUND="$candidate"
-    break
-  fi
-done
-# Round 2: glob ga_manager's addon-private path. Only if no literal hit.
-# The slug pattern *_ga_manager covers today's 99f1cad4_ga_manager and
-# any future re-build of the addon under a different installation slug.
-if [ -z "$GHCR_CREDS_FILE_FOUND" ]; then
+find_creds() {  # sets GHCR_CREDS_FILE_FOUND; rc 1 = no candidate file
+  # Round 1: literal paths (= cheap, common case)
+  for candidate in \
+      "$GHCR_CREDS_FILE" \
+      "/etc/ga/ghcr-creds.json" \
+      "/mnt/data/ghcr-creds.json"; do
+    if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+      GHCR_CREDS_FILE_FOUND="$candidate"
+      return 0
+    fi
+  done
+  # Round 2: glob ga_manager's addon-private path. Only if no literal hit.
+  # The slug pattern *_ga_manager covers today's 99f1cad4_ga_manager and
+  # any future re-build of the addon under a different installation slug.
   for _root in $SUPERVISOR_DATA_ROOTS; do
     for candidate in "$_root"/*_ga_manager/ghcr-creds.json; do
       if [ -f "$candidate" ]; then
         GHCR_CREDS_FILE_FOUND="$candidate"
-        break 2
+        return 0
       fi
     done
   done
-fi
-if [ -z "$GHCR_CREDS_FILE_FOUND" ]; then
-  fail "GHCR creds missing at all candidate paths (env / /etc/ga/ / /mnt/data/ / addon-private /data/) — provisioner did not deliver creds AND fleet-manager has not pushed any" 3
-fi
+  return 1
+}
+# Missing creds are normal while the mesh/fm is not reachable yet: look every
+# CREDS_POLL_S instead of exit 3 at once (DUT2 2026-11-24: 4 restarts, creds
+# seen 134 s late; 10 such cycles of 183 s exhaust StartLimitBurst after ~33 min,
+# Odoo #1747). Bound: T_END - CREDS_RESERVE_S, the reserve is for install, start
+# and the Core wait. The waited seconds are counted, not read from the clock.
+creds_left=$(( T_END - CREDS_RESERVE_S - $(date +%s) ))
+creds_spent=0
+until find_creds; do
+  if [ "$creds_spent" -ge "$creds_left" ]; then
+    fail "GHCR creds missing at all candidate paths (env / /etc/ga/ / /mnt/data/ / addon-private /data/) after waiting ${creds_spent}s — provisioner did not deliver creds AND fleet-manager has not pushed any" 3
+  fi
+  [ $(( creds_spent % CREDS_LOG_EVERY_S )) -ne 0 ] || \
+    log "GHCR creds not there yet (waited ${creds_spent}s of up to ${creds_left}s)"
+  "$SLEEP_CMD" "$CREDS_POLL_S"
+  creds_spent=$(( creds_spent + CREDS_POLL_S ))
+done
 [ "$GHCR_CREDS_FILE_FOUND" != "$GHCR_CREDS_FILE" ] && \
   log "GHCR creds found via fallback: $GHCR_CREDS_FILE_FOUND (env/default was $GHCR_CREDS_FILE)"
 log "registering GHCR credentials with Supervisor"
