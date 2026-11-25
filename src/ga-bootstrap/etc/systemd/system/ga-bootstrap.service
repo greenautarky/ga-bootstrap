@@ -41,11 +41,13 @@ SuccessExitStatus=0
 # hit. Once the marker `/mnt/data/.ga-bootstrapped` is written, retry
 # stops anyway (= Condition gate fires).
 #
-# RestartSec=180 (3 min) balances responsiveness vs storm-avoidance.
-# StartLimitBurst=10 in 3600s (1h, set in [Unit] above; shortest failing cycle
-# is 600 s readiness wait + 180 s RestartSec = 780 s -> <= 5 starts/h) caps the loop — after that operator
-# must intervene so we don't hide a permanent problem behind infinite
-# retries.
+# StartLimitBurst=10 in 3600 s (set in [Unit] above) refuses the 11th start when
+# 10 cycles fit into 3600 s, i.e. when a failing cycle is shorter than 360 s.
+# Missing creds wait inside the script (up to 1440 s), so that cycle is
+# >= 1440 + 180 s and retries for ever at a low rate; before (exit 3 at once,
+# 183 s) it was refused after ~33 min and the device stayed without ga_manager
+# until a reboot (Odoo #1747). The limit stays the cap for FAST real failures.
+# RestartSec below 180: check every fast exit against the 360 s rule first.
 Restart=on-failure
 RestartSec=180
 

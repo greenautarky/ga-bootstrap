@@ -1245,3 +1245,71 @@ def test_unparseable_addons_info_stdout_is_loud(run_bootstrap, fake_ha):
     result = run_bootstrap()
     out = result.stdout + result.stderr
     assert "ERROR: `ha addons info" in out and "not JSON" in out, out
+
+
+# --- 1.2.18: wait for GHCR creds inside the run (Odoo #1747) ----------------
+# Fake clock: SLEEP_CMD, one fake sleep = CREDS_POLL_S; the wait counts sleeps.
+
+def _creds_appear_after(tmp_path, bootstrap_env, n_sleeps):
+    """The sleep shim writes the creds file on its n-th call; returns its path."""
+    late = tmp_path / "late-creds.json"
+    sl = Path(bootstrap_env["SLEEP_CMD"])
+    sl.write_text(
+        "#!/bin/sh\n"
+        f'echo "$1" >> {tmp_path}/sleeps.log\n'
+        f'[ "$(wc -l < {tmp_path}/sleeps.log)" -lt {n_sleeps} ] || '
+        f"cp {bootstrap_env['GHCR_CREDS_FILE']} {late}\n")
+    return late
+
+
+def test_creds_arriving_after_780s_succeed_in_the_same_run(
+        run_bootstrap, bootstrap_env, tmp_path):
+    """2026-11-24: creds ~13 min late. Before: exit 3 at once and 4 restarts."""
+    late = _creds_appear_after(tmp_path, bootstrap_env, 78)
+    result = run_bootstrap(GHCR_CREDS_FILE=str(late), CREDS_RESERVE_S="900")
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert Path(bootstrap_env["MARKER"]).is_file()
+    assert _slept_total(tmp_path) == 780
+    assert 12 <= out.count("GHCR creds not there yet") <= 14
+
+
+def test_creds_never_is_exit_3_at_the_bound_and_not_before(
+        run_bootstrap, bootstrap_env, tmp_path):
+    result = run_bootstrap(GHCR_CREDS_FILE=str(tmp_path / "never.json"), CREDS_RESERVE_S="900")
+    assert result.returncode == 3, result.stdout + result.stderr
+    # 2340 - 900 = 1440; a few real seconds of the run may be gone already
+    assert 1400 <= _slept_total(tmp_path) <= 1440
+    assert not Path(bootstrap_env["MARKER"]).exists()
+    assert not [c for c in result.ha_calls if c[:2] == ["addons", "install"]]
+
+
+def test_creds_present_never_sleeps(run_bootstrap, tmp_path):
+    assert run_bootstrap(CREDS_RESERVE_S="900").returncode == 0
+    assert _slept_total(tmp_path) == 0
+
+
+def _creds_cycle():
+    """(cycle seconds, limit seconds) from the LIVE script and unit."""
+    import re
+
+    from conftest import BOOTSTRAP_SCRIPT, REPO_ROOT
+    unit = (REPO_ROOT / "src/ga-bootstrap/etc/systemd/system/ga-bootstrap.service").read_text()
+    script = BOOTSTRAP_SCRIPT.read_text()
+
+    def u(key):
+        return int(re.search(rf"^{key}=(\d+)$", unit, re.M).group(1))
+
+    def v(key):
+        return int(re.search(rf'^{key}="\$\{{{key}:-(\d+)\}}"', script, re.M).group(1))
+
+    return (v("BG_BUDGET_S") - v("CREDS_RESERVE_S") + u("RestartSec"),
+            u("StartLimitIntervalSec") / u("StartLimitBurst"), v("CREDS_RESERVE_S"),
+            v("HA_CORE_WAIT_S"))
+
+
+def test_missing_creds_cannot_exhaust_the_start_limit():
+    cycle, limit, reserve, core_wait = _creds_cycle()
+    assert limit == 360
+    assert cycle > limit, f"creds cycle {cycle}s: 10 starts fit into StartLimitIntervalSec"
+    assert reserve >= 900 > core_wait  # install + start + Core wait keep their time
